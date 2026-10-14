@@ -319,7 +319,7 @@ The machine-readable GPU evidence is under `runs/gpu-smoke-20261014/<model>/smok
 
 ### 8.5 Complete selected feature-cache inventory
 
-All four selected extractions completed on 2026-10-14 and passed full payload hashing and layout/value verification on KW60995. These are the complete bounded dataset selections, not the small integration caches in §8.4. Persistent publication to datawaha is still in progress; the source caches remain in RAM until independent destination verification completes.
+All four selected extractions completed on 2026-10-14 and passed full payload hashing and layout/value verification on KW60995. These are the complete bounded dataset selections, not the small integration caches in §8.4. All four caches are now durably published to datawaha: an independent KW60996 client re-read and matched SHA256 and byte counts for every destination file, and separate metadata verification passed for each cache.
 
 | Feature space | Training samples/groups | Validation samples/groups | Cache records | Total bytes including metadata |
 |---|---:|---:|---:|---:|
@@ -341,7 +341,7 @@ vggt/baf9ab1362a86690254c1d309d2fd24c98123543792ac10df7c3254dbe419eee
 vjepa21/48d207736b22d14c5df69568a0f35c14bd348597fea58bf88d350396da78ff8b
 ```
 
-Publication copies verified payloads first and publishes `COMPLETE.json` last. A partially copied identity directory is not a usable training cache. Use the matching directory as `CACHE` in §8.3 only after destination verification and publication finish.
+Publication copied payloads first and published each `COMPLETE.json` last. All 7,484 files, including the four final completion markers, are covered by the accepted destination proofs under `features/publication-proofs/20261014-tls/`: `<model>-result.json`, `metadata-<model>.json`, and batch proofs 1–517. A partially copied identity directory remains unusable; the four identity directories listed above have passed that gate and can be used as `CACHE` in §8.3.
 
 ### 8.6 Frozen linear classification probes
 
