@@ -14,8 +14,9 @@ from compression.cache import FeatureCacheDataset, FeatureCacheWriter
 from compression.model import ChannelStats, OrderedCompressor, export_compressor, load_compressor
 
 
-def labeled_cache(root: Path, *, model: str = "qwen", missing_label: bool = False) -> Path:
-    labels = {"train": [10, 20, 10, 20, 10, 20], "validation": [10, 20, 99]}
+def labeled_cache(root: Path, *, model: str = "qwen", missing_label: bool = False,
+                  train_samples: int = 6, variable_length: bool = False) -> Path:
+    labels = {"train": [10 if i % 2 == 0 else 20 for i in range(train_samples)], "validation": [10, 20, 99]}
     records = [{"sample_id": f"{split}-{i}", "split": split, "layer": None}
                for split, values in labels.items() for i in range(len(values))]
     writer = FeatureCacheWriter(root, {"model": model, "storage_dtype": "float16"}, records,
@@ -25,10 +26,23 @@ def labeled_cache(root: Path, *, model: str = "qwen", missing_label: bool = Fals
         label = labels[split][index]
         sign = -1.0 if label == 10 else 1.0
         features = np.array([[sign * 2, index * .1], [sign * 4, index * .2]], dtype=np.float32)
+        if variable_length:
+            count = 2 + index % 4
+            features = np.array([[sign * (token + 1), index * .1 + token * .2]
+                                 for token in range(count)], dtype=np.float32)
+            types = np.zeros(count, dtype=np.int64)
+            types[0] = 1
+            if count > 2:
+                types[-1] = 2
+        else:
+            types = np.array([0, 0], dtype=np.int64)
+        count = len(features)
+        positions = np.zeros((count, 3), dtype=np.int64)
+        patch_count = int((types == 0).sum())
+        positions[types == 0, 2] = np.arange(patch_count)
         metadata = {} if missing_label else {"manifest_record": {"label": label}}
         writer.add(sample_id=record["sample_id"], split=split, features=features,
-                   positions=np.array([[0, 0, 0], [0, 0, 1]], dtype=np.int64),
-                   token_types=np.array([0, 0], dtype=np.int64), grid=(1, 1, 2), metadata=metadata)
+                   positions=positions, token_types=types, grid=(1, 1, patch_count), metadata=metadata)
     writer.finish()
     return root
 
@@ -257,7 +271,7 @@ def test_real_compressor_encodes_once_then_physically_slices_and_pools(tmp_path,
                                         "--representations", "original,reconstructed,compressed",
                                         "--budgets", "1,4", "--epochs", "1"))
     assert result["status"] == "completed" and len(result["metrics"]) == 5
-    assert len(encoded) == 9 and decoded == [1, 4] * 9
+    assert [len(batch) for batch in encoded] == [6, 3] and decoded == [1, 4] * 2
     assert result["checkpoint_stage"] == "prefix" and result["checkpoint_step"] == 17
     assert result["checkpoint_sha256"] == probe.sha256_file(model_path)
     codes = np.load(root / "features/train-codes.npy", mmap_mode="r")
@@ -269,9 +283,10 @@ def test_real_compressor_encodes_once_then_physically_slices_and_pools(tmp_path,
     try:
         batch = probe.collate_features([dataset[0]])
         with torch.no_grad():
-            reconstruction = real_decode(encoded[0][:, :1], batch["positions"], batch["token_types"], batch["valid_mask"])
+            reconstruction = real_decode(encoded[0][:1, :1], batch["positions"], batch["token_types"], batch["valid_mask"])
             expected = probe.pool_native(reconstruction, batch["token_types"], batch["valid_mask"], "patch_mean")
-        np.testing.assert_allclose(np.load(root / "features/train-reconstructed-1.npy")[0], expected[0].numpy())
+        np.testing.assert_allclose(np.load(root / "features/train-reconstructed-1.npy")[0],
+                                   expected[0].numpy(), rtol=1e-5, atol=1e-6)
     finally:
         dataset.close()
         codes._mmap.close()
@@ -295,27 +310,123 @@ def test_invalid_checkpoint_or_budget_is_not_silently_clamped(tmp_path, wrong_id
     assert not (tmp_path / "run").exists()
 
 
-def test_deadline_during_preparation_commits_only_complete_rows_and_resumes(tmp_path, monkeypatch):
-    cache = labeled_cache(tmp_path / "cache")
-    root = tmp_path / "run"
-    original = probe.check_deadline
-    def stop_after_two_rows(deadline):
-        manifest_path = root / "features_manifest.json"
-        if manifest_path.exists() and json.loads(manifest_path.read_text())["rows_completed"]["train"] == 2:
-            raise probe.ProbeDeadline()
-        return original(deadline)
-    with monkeypatch.context() as patch:
-        patch.setattr(probe, "check_deadline", stop_after_two_rows)
-        stopped = probe.run_probe(arguments(cache, root, "--epochs", "1"))
-    assert stopped["status"] == "deadline" and stopped["metrics"] == []
-    manifest = json.loads((root / "features_manifest.json").read_text())
-    assert manifest["rows_completed"] == {"train": 2, "validation": 0}
-    assert manifest["completed"] is False
-    first = np.load(root / "features/train-original.npy")[:2].copy()
-    resumed = probe.run_probe(arguments(cache, root, "--epochs", "1"))
-    assert resumed["status"] == "completed"
-    np.testing.assert_array_equal(np.load(root / "features/train-original.npy")[:2], first)
-    assert json.loads((root / "features_manifest.json").read_text())["completed"] is True
+@pytest.mark.parametrize("interruption", ["deadline", "hard_failure", "flush_failure"])
+def test_feature_resume_preserves_durable_prefix_and_overwrites_partial_tail(tmp_path, monkeypatch, interruption):
+    cache = labeled_cache(tmp_path / "cache", train_samples=10, variable_length=True)
+    bundle = load_compressor(checkpoint(cache, tmp_path / "model.pt"))
+    datasets = {split: FeatureCacheDataset(cache, split) for split in ("train", "validation")}
+    indices = {split: list(range(len(dataset))) for split, dataset in datasets.items()}
+    full, partial = tmp_path / "full", tmp_path / "partial"
+    full.mkdir()
+    partial.mkdir()
+    monkeypatch.setattr(probe, "_FEATURE_BATCH_SAMPLES", 2)
+    monkeypatch.setattr(probe, "_FEATURE_CHECKPOINT_ROWS", 4)
+    monkeypatch.setattr(probe, "_FEATURE_CHECKPOINT_SECONDS", float("inf"))
+    args = (datasets, indices, ["original", "reconstructed", "compressed"], [1, 4],
+            "patch_mean", bundle, "cpu", {"regression": "feature-resume"}, None)
+    try:
+        expected = probe.prepare_features(full, *args)
+        real_encode, real_decode, real_flush = bundle.encode_native, bundle.decode_native, np.memmap.flush
+        encoded_batches = 0
+        def encode(*values, **kwargs):
+            nonlocal encoded_batches
+            encoded_batches += 1
+            return real_encode(*values, **kwargs)
+        def decode(codes, *values, **kwargs):
+            result = real_decode(codes, *values, **kwargs)
+            if encoded_batches == 4 and codes.shape[1] == 4:
+                # The fourth batch has original/direct/short-budget outputs,
+                # but not a complete all-condition result.
+                if interruption == "deadline":
+                    raise probe.ProbeDeadline()
+                raise RuntimeError("interrupted native decode")
+            return result
+        def flush(array, *values, **kwargs):
+            if str(array.filename).endswith("/train-reconstructed-4.npy"):
+                raise OSError("failed durable feature flush")
+            return real_flush(array, *values, **kwargs)
+        with monkeypatch.context() as patch:
+            if interruption == "flush_failure":
+                patch.setattr(np.memmap, "flush", flush)
+                exception = OSError
+            else:
+                patch.setattr(bundle, "encode_native", encode)
+                patch.setattr(bundle, "decode_native", decode)
+                exception = probe.ProbeDeadline if interruption == "deadline" else RuntimeError
+            with pytest.raises(exception):
+                probe.prepare_features(partial, *args)
+        manifest = json.loads((partial / "features_manifest.json").read_text())
+        committed = {"deadline": 6, "hard_failure": 4, "flush_failure": 0}[interruption]
+        assert manifest["rows_completed"] == {"train": committed, "validation": 0}
+        assert manifest["completed"] is False
+        for name in expected["arrays"]:
+            actual = np.load(partial / "features" / f"{name}.npy", mmap_mode="r+")
+            reference = np.load(full / "features" / f"{name}.npy")
+            if name.startswith("train-"):
+                np.testing.assert_array_equal(actual[:committed], reference[:committed])
+                actual[committed:] = -12345  # Even a plausible on-disk tail is not authoritative.
+            else:
+                actual[:] = -12345
+            actual.flush()
+            actual._mmap.close()
+        resumed = probe.prepare_features(partial, *args)
+        assert resumed == expected
+        for name in expected["arrays"]:
+            np.testing.assert_array_equal(np.load(partial / "features" / f"{name}.npy"),
+                                          np.load(full / "features" / f"{name}.npy"))
+    finally:
+        for dataset in datasets.values():
+            dataset.close()
+
+
+@pytest.mark.parametrize("device", ["cpu", pytest.param("cuda", marks=pytest.mark.skipif(
+    not torch.cuda.is_available(), reason="CUDA unavailable"))])
+@pytest.mark.parametrize("pooling", ["patch_mean", "cls"])
+def test_batched_native_features_match_explicit_unpadded_rows(tmp_path, monkeypatch, device, pooling):
+    cache = labeled_cache(tmp_path / "cache", variable_length=True)
+    bundle = load_compressor(checkpoint(cache, tmp_path / "model.pt"), map_location=device)
+    datasets = {split: FeatureCacheDataset(cache, split) for split in ("train", "validation")}
+    indices = {split: list(range(len(dataset))) for split, dataset in datasets.items()}
+    root = tmp_path / "features-run"
+    root.mkdir()
+    # Force both variable-length padding and multiple token-bounded batches,
+    # independently of the sample-count bound.
+    monkeypatch.setattr(probe, "_FEATURE_TOKEN_BUDGET", 12)
+    real_encode = bundle.encode_native
+    batch_shapes = []
+    def encode(native, *values, **kwargs):
+        batch_shapes.append(tuple(native.shape[:2]))
+        return real_encode(native, *values, **kwargs)
+    try:
+        with monkeypatch.context() as patch:
+            patch.setattr(bundle, "encode_native", encode)
+            manifest = probe.prepare_features(root, datasets, indices,
+                                              ["original", "reconstructed", "compressed"], [1, 4],
+                                              pooling, bundle, device, {"regression": "batched-native"}, None)
+        assert any(batch > 1 for batch, _ in batch_shapes)
+        assert all(batch * tokens <= 12 for batch, tokens in batch_shapes)
+        tolerance = {"rtol": 3e-4, "atol": 3e-5} if device == "cuda" else {"rtol": 1e-5, "atol": 1e-6}
+        with torch.inference_mode():
+            for split, dataset in datasets.items():
+                expected = {name: [] for name in manifest["arrays"] if name.startswith(split + "-")}
+                for row in indices[split]:
+                    batch = probe.collate_features([dataset[row]])
+                    native, positions, types, valid = (batch[key].to(device) for key in
+                                                      ("features", "positions", "token_types", "valid_mask"))
+                    codes = bundle.encode_native(native, positions, types, valid, num_codes=4)
+                    expected[f"{split}-original"].append(
+                        probe.pool_native(native, types, valid, pooling)[0].cpu().numpy())
+                    expected[f"{split}-codes"].append(codes[0].cpu().numpy())
+                    for budget in (1, 4):
+                        reconstructed = bundle.decode_native(codes[:, :budget], positions, types, valid)
+                        expected[f"{split}-reconstructed-{budget}"].append(
+                            probe.pool_native(reconstructed, types, valid, pooling)[0].cpu().numpy())
+                for name, rows in expected.items():
+                    np.testing.assert_allclose(np.load(root / "features" / f"{name}.npy"),
+                                               np.stack(rows), **tolerance)
+    finally:
+        for dataset in datasets.values():
+            dataset.close()
 
 
 def test_deadline_requires_timezone_and_elapsed_boundary_is_real():

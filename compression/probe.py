@@ -28,6 +28,13 @@ from .model import atomic_torch_save, load_compressor
 FORMAT = "compression-linear-probe/v1"
 DEFAULT_BUDGETS = (4, 32, 64, 128, 256)
 
+# Bound padded native activations as well as sample count, without changing the
+# selected row order or the persisted feature identity.
+_FEATURE_BATCH_SAMPLES = 64
+_FEATURE_TOKEN_BUDGET = 32768
+_FEATURE_CHECKPOINT_ROWS = 256
+_FEATURE_CHECKPOINT_SECONDS = 60.0
+
 
 class ProbeDeadline(Exception):
     """A resumable, non-failure stop at the explicit wall-clock boundary."""
@@ -134,7 +141,7 @@ def condition_name(condition: str, budget: int | None) -> str:
 def prepare_features(root: Path, datasets: dict, indices: dict, representations: list[str],
                      budgets: list[int], pooling: str, bundle: Any, device: str,
                      feature_identity: dict, deadline: float | None) -> dict:
-    """Commit rows only after every condition for that sample is flushed to disk."""
+    """Batch native extraction; publish only flushed, all-condition row prefixes."""
     manifest_path = root / "features_manifest.json"
     specs = {}
     max_k = max(budgets) if bundle is not None else None
@@ -188,32 +195,78 @@ def prepare_features(root: Path, datasets: dict, indices: dict, representations:
                 os.replace(tmp, path)
                 array = np.load(path, mmap_mode="r+", allow_pickle=False)
             arrays[name] = array
+        def commit(split: str, stop: int) -> None:
+            if stop == manifest["rows_completed"][split]:
+                return
+            for name, array in arrays.items():
+                if name.startswith(split + "-"):
+                    array.flush()
+                    # msync the mapping before fsyncing its file, including a
+                    # newly created header, before publishing the durable cursor.
+                    with (feature_dir / f"{name}.npy").open("rb") as handle:
+                        os.fsync(handle.fileno())
+            manifest["rows_completed"][split] = stop
+            atomic_json(manifest_path, manifest)
+
         with torch.inference_mode():
             for split, dataset in datasets.items():
-                for row in range(manifest["rows_completed"][split], len(indices[split])):
-                    check_deadline(deadline)
-                    batch = collate_features([dataset[indices[split][row]]])
-                    batch = {key: value.to(device) if isinstance(value, torch.Tensor) else value
-                             for key, value in batch.items()}
-                    native, positions, types, valid = (batch[key] for key in
-                                                      ("features", "positions", "token_types", "valid_mask"))
-                    if "original" in representations:
-                        arrays[f"{split}-original"][row] = pool_native(native, types, valid, pooling)[0].cpu().numpy()
-                    if bundle is not None:
-                        codes = bundle.encode_native(native, positions, types, valid, num_codes=max_k)
-                        if "compressed" in representations:
-                            arrays[f"{split}-codes"][row] = codes[0].cpu().numpy()
-                        if "reconstructed" in representations:
-                            for k in budgets:
-                                check_deadline(deadline)
-                                reconstructed = bundle.decode_native(codes[:, :k], positions, types, valid)
-                                arrays[f"{split}-reconstructed-{k}"][row] = pool_native(
-                                    reconstructed, types, valid, pooling)[0].cpu().numpy()
-                    for name, array in arrays.items():
-                        if name.startswith(split + "-"):
-                            array.flush()
-                    manifest["rows_completed"][split] = row + 1
-                    atomic_json(manifest_path, manifest)
+                row = manifest["rows_completed"][split]
+                last_commit = time.monotonic()
+                try:
+                    while row < len(indices[split]):
+                        check_deadline(deadline)
+                        stop, longest = row, 0
+                        while stop < min(row + _FEATURE_BATCH_SAMPLES, len(indices[split])):
+                            tokens = dataset.token_counts[indices[split][stop]]
+                            if stop > row and max(longest, tokens) * (stop - row + 1) > _FEATURE_TOKEN_BUDGET:
+                                break
+                            longest = max(longest, tokens)
+                            stop += 1
+                        samples = []
+                        for selected in indices[split][row:stop]:
+                            check_deadline(deadline)
+                            samples.append(dataset[selected])
+                        batch = collate_features(samples)
+                        del samples
+                        batch = {key: value.to(device) if isinstance(value, torch.Tensor) else value
+                                 for key, value in batch.items()}
+                        native, positions, types, valid = (batch[key] for key in
+                                                          ("features", "positions", "token_types", "valid_mask"))
+                        values = {}
+                        check_deadline(deadline)
+                        if "original" in representations:
+                            values[f"{split}-original"] = pool_native(native, types, valid, pooling).cpu().numpy()
+                        if bundle is not None:
+                            check_deadline(deadline)
+                            codes = bundle.encode_native(native, positions, types, valid, num_codes=max_k)
+                            check_deadline(deadline)
+                            if "compressed" in representations:
+                                values[f"{split}-codes"] = codes.cpu().numpy()
+                            if "reconstructed" in representations:
+                                for k in budgets:
+                                    check_deadline(deadline)
+                                    reconstructed = bundle.decode_native(codes[:, :k], positions, types, valid)
+                                    values[f"{split}-reconstructed-{k}"] = pool_native(
+                                        reconstructed, types, valid, pooling).cpu().numpy()
+                                    del reconstructed
+                                    check_deadline(deadline)
+                            del codes
+                        # A deadline or failure above leaves this entire batch
+                        # uncommitted. Resume always overwrites the durable tail.
+                        check_deadline(deadline)
+                        for name in values:
+                            arrays[name][row:stop] = values[name]
+                        del values, batch, native, positions, types, valid
+                        row = stop
+                        check_deadline(deadline)
+                        if (row - manifest["rows_completed"][split] >= _FEATURE_CHECKPOINT_ROWS
+                                or time.monotonic() - last_commit >= _FEATURE_CHECKPOINT_SECONDS):
+                            commit(split, row)
+                            last_commit = time.monotonic()
+                    commit(split, row)
+                except ProbeDeadline:
+                    commit(split, row)
+                    raise
         manifest["completed"] = True
         atomic_json(manifest_path, manifest)
         return manifest
