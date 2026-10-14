@@ -178,7 +178,7 @@ Compute prefix-safe per-code contributions in parallel and scan them. This is a 
 - **V3 — Partial-encoding claim:** If C2 and C3 equivalence is claimed, independently compare E_k(X) with E_K(X)_{1:k}.
 - **V4 — Capacity accounting:** Include output work, hidden states, code width, dtype, quantizer, and metadata—not only attention scores or code count.
 
-A small numerical check during document preparation verified the single-layer prefix-attention output identity and the weighted-loss identity. No model architecture, training speedup, gradient-sharing implementation, or task benefit has been evaluated.
+A small numerical check during document preparation verified the single-layer prefix-attention output identity and the weighted-loss identity. That check did not evaluate training speedup, gradient-sharing implementation, or task benefit. Compressor execution checks are recorded in §8.4.
 
 ## 6. Budgets, quality selection, and bits
 
@@ -298,6 +298,24 @@ python -m compression.evaluate --checkpoint "$RUN/prefix/model.pt" \
 ```
 
 Use `qwen38.json`, `vggt_l23.json`, or `vjepa21.json` for the other feature spaces. Smoke runs establish execution and checkpoint correctness only; meaningful compression claims require trained held-out reconstruction curves and matched baselines.
+
+### 8.4 Executed verification
+
+On 2026-10-14, all four native extractors and cached-feature compressor paths completed GPU smoke runs on KW60995's RTX A6000 GPUs. Each smoke used two training and two validation samples; Omega retained all four selected layers and trained the layer-23 compressor.
+
+| Feature space | Native tokens × channels per sample/layer | Smoke cache records |
+|---|---:|---:|
+| DINOv3 | 581 × 4096 | 4 |
+| Qwen3.8 | 576 × 1152 | 4 |
+| VGGT-Omega | 4124 × 2048 | 16 |
+| V-JEPA 2.1 / SSv2 | 4608 × 768 | 4 |
+
+- **V5 — Native caches:** Full payload hashing and layout/value verification passed for each smoke cache.
+- **V6 — Training lifecycle:** Each feature space completed three fixed-stage optimizer steps, resumed to step five with changed weights and populated optimizer state, then completed three prefix-stage steps and held-out evaluation at budgets 1, 2, 4, 8, and 16. These bounded lifecycle runs used width 64, 16 codes, and one encoder/decoder block.
+- **V7 — Production dimensions:** Separately, each feature space completed finite forward/backward passes with width 512, 256 codes, four encoder/decoder blocks, and both separate and joint encoder attention. The resulting code shape was `1 × 256 × 512`. These are execution checks, not completed production-size training runs.
+- **V8 — Regression checks:** Seven video-sampling tests and 60 cache/model/training tests passed, including corrupted-cache rejection, bounded memory-map resources, prefix behavior, and exact stochastic training resume.
+
+The machine-readable GPU evidence is under `runs/gpu-smoke-20261014/<model>/smoke-proof.json` in the shared project root, alongside checkpoints and validation metrics. No long compressor-training run or compression-quality claim follows from these smokes.
 
 
 ## 9. Relationship to the SLAM direction
