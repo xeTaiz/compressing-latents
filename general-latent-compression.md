@@ -370,13 +370,19 @@ Artifacts include `probe_config.json`, per-epoch `probe_log.jsonl`, atomic `prob
 
 On 2026-10-14, actual CPU CLI smokes used two native training and two validation records per model, width 16, K256, one fixed-stage step, one prefix-stage step, and one probe epoch. Both models produced all 11 requested condition/budget rows. Independently recomputed native pooling, reconstructed vectors, direct codes, train-only normalization, and saved-head metrics matched the artifacts exactly. A native-derived bounded campaign completed all ten child commands; a separate ten-second deadline scenario stopped before its cutoff and reported missing stages as deadline-limited. These checks establish execution, not classification quality. The updated campaign/training/results regression suites passed 62 tests.
 
+The complete commands, observed results, independent checks, and deadline evidence are preserved in `runs/cli-smoke-20261014/smoke-proof.json` under the shared project root. Temporary model/feature files from those bounded CPU checks were removed afterward.
+
 ### 8.7 Live dashboard and deadline-bound campaign
 
 The worker-hosted notebook is available at **http://100.64.0.72:18003**. Its portable source is `notebooks/compression_dashboard.py`; its plotting dependencies are in `notebooks/requirements.txt`. The live instance reads the shared project root and refreshes every 15 seconds, with a manual refresh button and manifest-path, model, run, stage, and scope controls.
 
 The dashboard displays separate fixed/prefix loss, learning rate and throughput curves; held-out reconstruction versus budget; and linear-probe top-1/top-5 versus budget, with original-feature baselines. It exposes actual completed steps, statuses, deadline, artifact lag, failures, class coverage, capacity, and provenance. Existing four-model lifecycle smokes are explicitly labeled and remain separate from pilot quality results. Missing metrics stay pending rather than becoming zero accuracy. The reader does not import PyTorch.
 
+Live step counts use the highest valid completed-step observation from the same stage's trusted state, summary, and optimizer logs, so infrequent checkpoint/state updates cannot mask newer progress. A validated running experiment's current-stage marker upgrades that stage's stale pending snapshot to running, without promoting future stages or overriding terminal statuses. The running GPU campaigns exercised these rules in the hosted UI; the updated reader suite passed 47 tests.
+
 The `overnight-20261014` campaign schedules DINO and Qwen at K256 and K512 using the complete selected caches. It reuses these caches, not the small K16 smoke checkpoints as production weights. Each model shares one original-feature baseline across its two runs. Two one-GPU jobs were queued on KW60996 behind its existing work, without interrupting unrelated experiments. Their identifiers are recorded in the campaign manifest under `runs/overnight-20261014/campaign.json`; queued does not mean running or completed.
+
+Both model jobs subsequently began real GPU training on separate RTX A6000s. Finite optimizer logs, checkpoint files, assigned-device process state, and live plotted curves were observed. Later K512 stages and full-data classification results must be assessed from their actual artifacts, not inferred from successful startup.
 
 C11
 ```bash

@@ -10,6 +10,7 @@ from __future__ import annotations
 
 from datetime import datetime, timezone
 import json
+from itertools import chain
 from pathlib import Path
 from typing import Any
 
@@ -109,19 +110,31 @@ def _experiment(reader: _Reader, root: Path, entry: dict[str, Any],
         summary = reader.json(folder / "summary.json")
         log = reader.jsonl(folder / "train_log.jsonl")
         stage_state = state.get("stages", {}).get(name, {})
-        actual_steps = stage_state.get("step")
-        if actual_steps is None:
-            actual_steps = state.get("actual_completed_steps", {}).get(name)
-        if actual_steps is None:
-            actual_steps = (summary or {}).get("step")
-        if actual_steps is None and log:
-            actual_steps = log[-1].get("step")
+        # Snapshots can lag optimizer logs, while final snapshots can include
+        # unlogged steps. Keep the highest valid completed count from either.
+        actual_steps = None
+        for step in chain(
+            (stage_state.get("step"), state.get("actual_completed_steps", {}).get(name),
+             (summary or {}).get("step")),
+            (row.get("step") for row in log),
+        ):
+            if type(step) not in (int, float) or step < 0:
+                continue
+            if isinstance(step, float) and not step.is_integer():
+                continue
+            actual_steps = max(actual_steps or 0, int(step))
+        status = stage_state.get("status") or (summary or {}).get("status") or (
+            "completed" if summary else "running" if log else "pending")
+        # The campaign publishes its current child before training, but retains
+        # the preflight stage snapshot until that child exits. Only the trusted
+        # current running stage can supersede that pending snapshot.
+        if status == "pending" and state.get("status") == "running" and state.get("stage") == name:
+            status = "running"
         stages.append({"stage": name, "path": str(folder), "config": config,
                        "summary": summary, "curves": log, "state": stage_state,
                        "actual_completed_steps": actual_steps,
                        "configured_steps": (config or {}).get("max_steps"),
-                       "status": stage_state.get("status") or (summary or {}).get("status") or
-                                 ("completed" if summary else "running" if log else "pending")})
+                       "status": status})
     eval_path = _path(root, artifacts.get("eval_path") or entry.get("eval_path"),
                       run / "prefix" / "validation.json")
     evaluation = reader.json(eval_path)
