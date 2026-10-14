@@ -2,6 +2,6 @@
 # No backbone packages are needed. Pick the torch wheel index for the host, e.g.
 #   CUDA: pip install --extra-index-url https://download.pytorch.org/whl/cu126 -r requirements-compression.txt
 #   CPU:  pip install --extra-index-url https://download.pytorch.org/whl/cpu -r requirements-compression.txt
-torch==2.7.1
+torch==2.13.0
 numpy==2.2.6
 pytest>=8,<9
