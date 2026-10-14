@@ -1,0 +1,70 @@
+{
+  "name": "dinov3_vit7b_block39",
+  "feature_dim": 4096,
+  "data": {
+    "model": "dinov3",
+    "identity": null,
+    "layer": null,
+    "train_split": "train",
+    "eval_split": "validation",
+    "token_budget": 32768,
+    "num_workers": 4
+  },
+  "model": {
+    "width": 512,
+    "max_codes": 256,
+    "encoder_layers": 4,
+    "decoder_layers": 4,
+    "heads": 8,
+    "ff_multiplier": 4,
+    "attention_mode": "separate",
+    "dropout": 0.0,
+    "position_frequencies": 16,
+    "max_position_frequency": 64.0
+  },
+  "stats": {
+    "max_samples": null,
+    "std_floor": 1e-06
+  },
+  "optim": {
+    "lr": 0.0001,
+    "betas": [
+      0.9,
+      0.95
+    ],
+    "eps": 1e-08,
+    "weight_decay": 0.05,
+    "grad_clip": 1.0,
+    "warmup_steps": 500
+  },
+  "precision": "bf16",
+  "seed": 0,
+  "stages": {
+    "fixed": {
+      "max_steps": 10000,
+      "budget": null
+    },
+    "prefix": {
+      "max_steps": 20000,
+      "full_weight": 0.5,
+      "short_budgets": null,
+      "short_weights": null,
+      "init_from": "fixed"
+    }
+  },
+  "checkpoint_every": 1000,
+  "log_every": 50,
+  "eval": {
+    "budgets": [
+      1,
+      2,
+      4,
+      8,
+      16,
+      32,
+      64,
+      128,
+      256
+    ]
+  }
+}

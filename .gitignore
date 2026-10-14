@@ -1,0 +1,60 @@
+# Local virtual environments
+.venvs/
+.venv/
+venv/
+env/
+
+# Secrets and credentials
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.p12
+*.pfx
+.netrc
+.git-credentials
+credentials.json
+secrets.json
+*.token
+hf_token*
+.huggingface/
+.cache/huggingface/
+
+# Datasets, checkpoints, extracted features, and run outputs
+data/
+datasets/
+checkpoints/
+features/
+runs/
+outputs/
+wandb/
+*.pt
+*.pth
+*.ckpt
+*.safetensors
+*.bin
+*.npy
+*.npz
+*.h5
+*.hdf5
+*.zarr/
+*.tar
+*.tar.gz
+*.zip
+
+# Generated caches
+.cache/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.ipynb_checkpoints/
+__marimo__/
+
+# Editor / OS
+.DS_Store
+.idea/
+.vscode/
+*.swp

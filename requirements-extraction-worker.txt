@@ -1,0 +1,12 @@
+# Small pure/binary-wheel overlay for compression.extract on an existing CUDA worker runtime.
+# Install with --no-deps into a separate target (never into or over the CUDA PyTorch env):
+#   python -m pip install --no-cache-dir --no-deps --target /dev/shm/compressing-latents-deps \
+#     -r requirements-extraction-worker.txt
+#   PYTHONPATH=/dev/shm/compressing-latents-deps:$PYTHONPATH python -m compression.extract ...
+# The base runtime supplies torch/torchvision (CUDA), numpy, Pillow, einops and opencv-python-headless.
+# dinov3 and vggt need nothing here (vggt_omega comes from the pinned source checkout on PYTHONPATH).
+timm @ https://github.com/huggingface/pytorch-image-models/archive/12c4939be518a6d02d5d3b47b0b2bed49ad32312.tar.gz
+safetensors==0.6.2
+huggingface-hub==0.36.0
+PyYAML==6.0.3
+av==16.0.1
