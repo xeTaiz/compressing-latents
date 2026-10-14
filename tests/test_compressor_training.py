@@ -344,3 +344,80 @@ def test_cli_training_and_heldout_prefix_evaluation(toy_cache, tmp_path):
     with pytest.raises(ValueError, match="identity"):
         evaluate_cli.main(["--checkpoint", str(model_path), "--cache-dir", str(foreign), "--device", "cpu",
                            "--output", str(tmp_path / "foreign.json")])
+
+
+def test_deadline_at_safe_step_forces_log_checkpoint_export_and_exact_resume(toy_cache, tmp_path, monkeypatch):
+    config = tiny_config("log_every=1000", "checkpoint_every=1000", "model.dropout=0.2")
+    straight, interrupted = tmp_path / "straight", tmp_path / "interrupted"
+    run(config, "fixed", toy_cache, straight, max_steps=3)
+    checks = iter((False, True))  # before optimizer step, then after its safe boundary
+    monkeypatch.setattr(train_cli, "_deadline_reached", lambda deadline: next(checks))
+    summary = run(config, "fixed", toy_cache, interrupted, max_steps=3, deadline="2026-10-15T08:00:00+03:00")
+    assert summary["status"] == "deadline" and summary["stop_reason"] == "deadline"
+    assert summary["step"] == 1 and summary["max_steps"] == 3
+    checkpoint = torch.load(interrupted / "fixed" / "checkpoint_latest.pt", weights_only=True)
+    assert checkpoint["step"] == 1 and checkpoint["cursor"]["batch"] == 1
+    assert checkpoint["stop_reason"] == "deadline"
+    assert load_compressor(interrupted / "fixed" / "model.pt").metadata["step"] == 1
+    rows = [json.loads(line) for line in (interrupted / "fixed" / "train_log.jsonl").read_text().splitlines()]
+    assert [row["step"] for row in rows] == [1]
+    monkeypatch.setattr(train_cli, "_deadline_reached", lambda deadline: False)
+    resumed = run(config, "fixed", toy_cache, interrupted, max_steps=3, resume=True)
+    assert resumed["status"] == "completed" and resumed["stop_reason"] == "max_steps"
+    assert_same_state(model_state(straight / "fixed" / "model.pt"), model_state(interrupted / "fixed" / "model.pt"))
+
+
+def test_expired_deadline_saves_zero_step_without_claiming_training(toy_cache, tmp_path):
+    from compression.campaign import inspect_stage
+    config = tiny_config("stages.fixed.max_steps=2")
+    summary = run(config, "fixed", toy_cache, tmp_path, deadline="2000-01-01T00:00:00+00:00")
+    assert summary["status"] == "deadline" and summary["step"] == 0
+    assert load_compressor(tmp_path / "fixed" / "model.pt").metadata["step"] == 0
+    info = inspect_stage({"run_dir": str(tmp_path)}, config, "fixed", summary["cache"]["identity"], "cpu")
+    assert info["status"] == "partial" and not info.get("inference_ready", False)
+    assert not (tmp_path / "fixed" / "train_log.jsonl").exists()
+
+
+def test_naive_deadline_rejected_before_creating_run_artifacts(toy_cache, tmp_path):
+    with pytest.raises(ValueError, match="timezone-aware"):
+        run(tiny_config(), "fixed", toy_cache, tmp_path, deadline="2026-10-15T08:00:00")
+    assert not list(tmp_path.iterdir())
+
+
+def test_failed_resume_summary_reports_last_persisted_step_not_new_target(toy_cache, tmp_path, monkeypatch):
+    config = tiny_config()
+    run(config, "fixed", toy_cache, tmp_path, max_steps=2)
+    checkpoint_path = tmp_path / "fixed" / "checkpoint_latest.pt"
+    before = checkpoint_path.read_bytes()
+    def fail(*args, **kwargs):
+        raise FloatingPointError("deliberate non-finite objective")
+    monkeypatch.setattr(train_cli, "objective_loss", fail)
+    with pytest.raises(FloatingPointError):
+        run(config, "fixed", toy_cache, tmp_path, max_steps=5, resume=True)
+    summary = json.loads((tmp_path / "fixed" / "summary.json").read_text())
+    assert summary["status"] == "failed" and summary["step"] == 2 and summary["max_steps"] == 5
+    assert summary["model"] is None and checkpoint_path.read_bytes() == before
+
+
+def test_campaign_stage_validation_reuses_only_proven_compatible_steps(toy_cache, tmp_path):
+    from compression.campaign import inspect_stage
+    config = tiny_config("stages.fixed.max_steps=4")
+    summary = run(config, "fixed", toy_cache, tmp_path, max_steps=2)
+    entry = {"run_dir": str(tmp_path)}
+    identity = summary["cache"]["identity"]
+    first = inspect_stage(entry, config, "fixed", identity, "cpu")
+    assert first["status"] == "partial" and first["step"] == 2 and first["inference_ready"]
+    stale_export = (tmp_path / "fixed" / "model.pt").read_bytes()
+    run(config, "fixed", toy_cache, tmp_path, max_steps=4, resume=True)
+    complete = inspect_stage(entry, config, "fixed", identity, "cpu")
+    assert complete["status"] == "completed" and complete["step"] == 4
+    with pytest.raises(ValueError, match="incompatible"):
+        inspect_stage(entry, tiny_config("stages.fixed.max_steps=4", "optim.lr=0.002"), "fixed", identity, "cpu")
+    with pytest.raises(ValueError, match="incompatible"):
+        inspect_stage(entry, config, "fixed", "foreign-cache", "cpu")
+    (tmp_path / "fixed" / "model.pt").write_bytes(stale_export)
+    interrupted = inspect_stage(entry, config, "fixed", identity, "cpu")
+    assert interrupted["status"] == "partial" and interrupted["step"] == 4
+    assert not interrupted["inference_ready"]
+    run(config, "fixed", toy_cache, tmp_path, max_steps=4, resume=True)
+    assert inspect_stage(entry, config, "fixed", identity, "cpu")["status"] == "completed"

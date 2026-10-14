@@ -31,6 +31,7 @@ import sys
 import time
 from contextlib import nullcontext
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Iterator
 
@@ -596,6 +597,20 @@ def _truncate_log(path: Path, last_step: int) -> None:
 # Stage runner
 # ---------------------------------------------------------------------------
 
+def parse_deadline(value: str | datetime | None) -> datetime | None:
+    """Accept only explicit timezone-aware wall-clock deadlines."""
+    if value is None:
+        return None
+    deadline = datetime.fromisoformat(value) if isinstance(value, str) else value
+    if not isinstance(deadline, datetime) or deadline.tzinfo is None or deadline.utcoffset() is None:
+        raise ValueError("deadline must be a timezone-aware ISO8601 datetime")
+    return deadline.astimezone(timezone.utc)
+
+
+def _deadline_reached(deadline: datetime | None) -> bool:
+    return deadline is not None and datetime.now(timezone.utc) >= deadline
+
+
 
 def train_stage(
     config: dict[str, Any],
@@ -609,12 +624,14 @@ def train_stage(
     device: str | torch.device | None = None,
     num_workers: int | None = None,
     dry_run: bool = False,
+    deadline: str | datetime | None = None,
     log: Callable[[str], None] = lambda message: print(message, flush=True),
 ) -> dict[str, Any]:
     """Run (or resume) one training stage; returns a JSON-serialisable summary."""
 
     if stage not in STAGES:
         raise ValueError(f"stage must be one of {STAGES}")
+    deadline = parse_deadline(deadline)
     config = validate_config(copy.deepcopy(config))
     cache_dir, run_dir = Path(cache_dir), Path(run_dir)
     device = torch.device(device if device is not None else ("cuda" if torch.cuda.is_available() else "cpu"))
@@ -762,10 +779,15 @@ def train_stage(
         },
     )
 
+    stop_reason = "max_steps"
+    last_saved_step = step if resume else 0
+    last_saved_boundary: tuple[int, str] | None = None
+
     def metadata() -> dict[str, Any]:
         return {
             "stage": stage,
             "step": step,
+            "stop_reason": stop_reason,
             "cache": cache_info,
             "objective": objective.to_dict(),
             "config": config,
@@ -774,6 +796,7 @@ def train_stage(
         }
 
     def save_checkpoint() -> None:
+        nonlocal last_saved_step, last_saved_boundary
         atomic_torch_save(
             {
                 "format": CHECKPOINT_FORMAT,
@@ -789,6 +812,7 @@ def train_stage(
             },
             checkpoint_path,
         )
+        last_saved_step, last_saved_boundary = step, (step, stop_reason)
 
     stream = BatchStream(
         dataset,
@@ -806,8 +830,16 @@ def train_stage(
     window: dict[str, float] = {}
     window_start = time.perf_counter()
     batches = iter(stream)
+    write_json(stage_dir / "summary.json", {
+        "stage": stage, "step": step, "max_steps": total_steps, "status": "running",
+        "cache": cache_info, "checkpoint": str(checkpoint_path) if checkpoint_path.exists() else None,
+        "model": None, "stop_reason": None,
+    })
     try:
         while step < total_steps:
+            if _deadline_reached(deadline):
+                stop_reason = "deadline"
+                break
             batch = next(batches)
             valid = batch["valid_mask"].to(device, non_blocking=True)
             positions = batch["positions"].to(device, non_blocking=True)
@@ -843,8 +875,11 @@ def train_stage(
             window["grad_norm"] = window.get("grad_norm", 0.0) + grad_norm
             window["samples"] = window.get("samples", 0) + len(batch["sample_ids"])
             window["tokens"] = window.get("tokens", 0) + int(batch["valid_mask"].sum())
+            reached_deadline = _deadline_reached(deadline)
+            if reached_deadline and step < total_steps:
+                stop_reason = "deadline"
 
-            if step % config["log_every"] == 0 or step == total_steps:
+            if step % config["log_every"] == 0 or step == total_steps or reached_deadline:
                 elapsed = time.perf_counter() - window_start
                 n = window["steps"]
                 record = {
@@ -866,17 +901,31 @@ def train_stage(
                     handle.write(json.dumps(record) + "\n")
                 log(json.dumps(record))
                 window, window_start = {}, time.perf_counter()
-            if step % config["checkpoint_every"] == 0 or step == total_steps:
+            if step % config["checkpoint_every"] == 0 or step == total_steps or reached_deadline:
                 save_checkpoint()
+            if reached_deadline:
+                break
+    except Exception as error:
+        write_json(stage_dir / "summary.json", {
+            "stage": stage, "step": last_saved_step, "attempted_step": step,
+            "max_steps": total_steps, "status": "failed", "stop_reason": "error",
+            "error": f"{type(error).__name__}: {error}", "cache": cache_info,
+            "checkpoint": str(checkpoint_path) if checkpoint_path.exists() else None, "model": None,
+        })
+        raise
     finally:
         batches.close()
 
-    if not checkpoint_path.exists():  # max_steps == 0 on a fresh stage
-        save_checkpoint()
+    if last_saved_boundary != (step, stop_reason):
+        save_checkpoint()  # also persists a deadline stop between periodic checkpoints
     export_compressor(model_path, model, stats, metadata())
     summary = {
         "stage": stage,
         "step": step,
+        "max_steps": total_steps,
+        "status": "completed" if step >= total_steps else "deadline",
+        "stop_reason": stop_reason,
+        "deadline": deadline.isoformat() if deadline is not None else None,
         "checkpoint": str(checkpoint_path),
         "model": str(model_path),
         "stats": str(stats_path),
@@ -943,6 +992,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--set", action="append", default=[], metavar="KEY=JSON",
                         help="override a config value, e.g. --set model.width=64 (repeatable)")
     parser.add_argument("--dry-run", action="store_true", help="resolve config/cache/batches and exit")
+    parser.add_argument("--deadline", help="timezone-aware ISO8601; stop at a safe optimizer boundary and save")
     args = parser.parse_args(argv)
 
     config = load_config(args.config, args.set)
@@ -959,6 +1009,7 @@ def main(argv: list[str] | None = None) -> int:
         device=args.device,
         num_workers=args.num_workers,
         dry_run=args.dry_run,
+        deadline=args.deadline,
     )
     print(json.dumps(summary, indent=2, sort_keys=True))
     return 0

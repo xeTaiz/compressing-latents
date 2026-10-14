@@ -317,6 +317,79 @@ On 2026-10-14, all four native extractors and cached-feature compressor paths co
 
 The machine-readable GPU evidence is under `runs/gpu-smoke-20261014/<model>/smoke-proof.json` in the shared project root, alongside checkpoints and validation metrics. No long compressor-training run or compression-quality claim follows from these smokes.
 
+### 8.5 Complete selected feature-cache inventory
+
+All four selected extractions completed on 2026-10-14 and passed full payload hashing and layout/value verification on KW60995. These are the complete bounded dataset selections, not the small integration caches in §8.4. Persistent publication to datawaha is still in progress; the source caches remain in RAM until independent destination verification completes.
+
+| Feature space | Training samples/groups | Validation samples/groups | Cache records | Total bytes including metadata |
+|---|---:|---:|---:|---:|
+| DINOv3 | 10,000 | 1,000 | 11,000 | 52,454,844,050 |
+| Qwen3.8 | 10,000 | 1,000 | 11,000 | 14,695,835,125 |
+| VGGT-Omega | 3,200 | 100 | 13,200 | 223,760,701,684 |
+| V-JEPA 2.1 / SSv2 | 10,000 | 1,000 | 11,000 | 78,540,371,584 |
+| **Total** | | | **46,200** | **369,451,752,443** |
+
+Omega stores one record per group per layer at layers 4, 11, 17, and 23; its default compressor configuration selects layer 23. The total footprint is 369.45 GB (344.08 GiB), excluding raw datasets, checkpoints, and smoke outputs.
+
+The immutable cache identity directories, relative to `features/cache/`, are:
+
+C9
+```text
+dinov3/ac3922fb497ef01bc626ae3c9648ccb24573ad08d1d8217ed4ffbe2bf322d5bc
+qwen38/0b8712625658c0491a08c61a7e7c75dd98654777cd29dbbda8ddf1e88e3dfe03
+vggt/baf9ab1362a86690254c1d309d2fd24c98123543792ac10df7c3254dbe419eee
+vjepa21/48d207736b22d14c5df69568a0f35c14bd348597fea58bf88d350396da78ff8b
+```
+
+Publication copies verified payloads first and publishes `COMPLETE.json` last. A partially copied identity directory is not a usable training cache. Use the matching directory as `CACHE` in §8.3 only after destination verification and publication finish.
+
+### 8.6 Frozen linear classification probes
+
+`compression.probe` evaluates DINO and Qwen on the existing official training/validation selections without loading either backbone. The selected image cache contains 10,000 training samples covering all 1,000 classes and 1,000 validation samples covering 641 classes; no validation class is absent from training. This is a bounded pilot, not the full ImageNet validation benchmark.
+
+| Condition | Input to the linear classifier | Code budgets |
+|---|---|---|
+| Original | DINO type-1 CLS token, excluding registers; Qwen mean of type-0 patch tokens | None |
+| Reconstructed | The same native pooling after decoding the first K codes | 4, 32, 64, 128, 256 |
+| Compressed | The first K ordered code vectors flattened directly, without decoding | 4, 32, 64, 128, 256 |
+
+The direct compressed representation has `K × width` coordinates. Its classifier capacity therefore changes with K and differs from the native-feature head; these are not capacity-matched comparisons. The implementation encodes the maximum required budget once and physically slices that ordered prefix. A K512 checkpoint also supports the additional budget 512.
+
+C10
+```bash
+python -m compression.probe --cache-dir "$CACHE" \
+  --checkpoint "$RUN/prefix/model.pt" --run-dir "$RUN/linear-probes" \
+  --representations original,reconstructed,compressed \
+  --budgets 4,32,64,128,256 --epochs 50 --batch-size 256 \
+  --lr 0.1 --weight-decay 0 --seed 0 --device cuda
+```
+
+For a reusable original-feature baseline, use `--representations original`, omit `--checkpoint`, and select a separate output directory. Heads use train-only affine standardization, SGD with momentum 0.9, and a cosine learning-rate schedule; the compressor remains frozen. There is no validation-based hyperparameter selection. Top-1/top-5 use all validation samples as the denominator, including unseen labels as incorrect; cross-entropy uses only labels known to training. Top-5 uses at most the number of training classes.
+
+Artifacts include `probe_config.json`, per-epoch `probe_log.jsonl`, atomic `probe_results.json`, memory-mapped feature arrays, and resumable classifier checkpoints. Cache identity, checkpoint SHA256, exact sample selection, class coverage, pooling, feature dimensions, classifier parameter counts, and protocol accompany results. Partial epochs/results and deadline stops remain explicit. Resume rejects incompatible provenance rather than silently mixing experiments.
+
+On 2026-10-14, actual CPU CLI smokes used two native training and two validation records per model, width 16, K256, one fixed-stage step, one prefix-stage step, and one probe epoch. Both models produced all 11 requested condition/budget rows. Independently recomputed native pooling, reconstructed vectors, direct codes, train-only normalization, and saved-head metrics matched the artifacts exactly. A native-derived bounded campaign completed all ten child commands; a separate ten-second deadline scenario stopped before its cutoff and reported missing stages as deadline-limited. These checks establish execution, not classification quality. The updated campaign/training/results regression suites passed 62 tests.
+
+### 8.7 Live dashboard and deadline-bound campaign
+
+The worker-hosted notebook is available at **http://100.64.0.72:18003**. Its portable source is `notebooks/compression_dashboard.py`; its plotting dependencies are in `notebooks/requirements.txt`. The live instance reads the shared project root and refreshes every 15 seconds, with a manual refresh button and manifest-path, model, run, stage, and scope controls.
+
+The dashboard displays separate fixed/prefix loss, learning rate and throughput curves; held-out reconstruction versus budget; and linear-probe top-1/top-5 versus budget, with original-feature baselines. It exposes actual completed steps, statuses, deadline, artifact lag, failures, class coverage, capacity, and provenance. Existing four-model lifecycle smokes are explicitly labeled and remain separate from pilot quality results. Missing metrics stay pending rather than becoming zero accuracy. The reader does not import PyTorch.
+
+The `overnight-20261014` campaign schedules DINO and Qwen at K256 and K512 using the complete selected caches. It reuses these caches, not the small K16 smoke checkpoints as production weights. Each model shares one original-feature baseline across its two runs. Two one-GPU jobs were queued on KW60996 behind its existing work, without interrupting unrelated experiments. Their identifiers are recorded in the campaign manifest under `runs/overnight-20261014/campaign.json`; queued does not mean running or completed.
+
+C11
+```bash
+python -m compression.campaign \
+  --manifest "$ROOT/runs/overnight-20261014/campaign.json" \
+  --experiment-ids dinov3-k256,dinov3-k512 --device cuda
+```
+
+The manifest uses format `compression-campaign/v1` and explicit experiment paths; relative paths resolve from its parent directory. The Qwen assignment uses `qwen38-k256,qwen38-k512`. Do not launch duplicate assignments alongside the scheduled jobs. The actual campaign cutoff is **2026-10-15 08:00 UTC+03:00**, supplied by the manifest rather than hardcoded into reusable code.
+
+The runner divides remaining time among its assigned experiments, initially allocating 22% to fixed training, 48% to prefix training, and 30% to reconstruction/probes, carrying unused time forward. Configured targets remain 10,000/20,000 training steps, but the deadline takes precedence; actual step counts and partial probe epochs determine what was achieved. Graceful trainer boundaries save normal checkpoints, while the campaign enforces subprocess cutoffs and reserves cleanup time. It uses immutable checkpoint snapshots and SHA256-bound evaluation/probe artifacts, preserving older generations when weights change. `state.json` merges disjoint assignments atomically; the dashboard accepts overrides only from matching campaign identity/version.
+
+
 
 ## 9. Relationship to the SLAM direction
 

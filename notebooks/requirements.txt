@@ -1,0 +1,3 @@
+# CPU-only dashboard dependencies; compression.results is standard-library only.
+marimo==0.23.16
+altair>=6.3,<7
