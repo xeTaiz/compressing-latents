@@ -19,6 +19,7 @@ def imports():
     from compression.results import load_campaign, load_smokes
 
     return (
+        Path,
         alt,
         datetime,
         json,
@@ -173,9 +174,65 @@ def probes(alt, line_chart, mo, probe_epoch_rows, probe_rows):
 
 
 @app.cell(hide_code=True)
-def provenance(campaign_data, json, mo, selected_experiments, smoke_data):
-    _provenance = [{"id": e["id"], "model": e["model"], "scope": e["scope"], "manifest_entry": e["manifest_entry"], "state": e["state"], "stages": [{"stage": s["stage"], "config": s["config"], "summary": s["summary"]} for s in e["stages"]], "evaluation_provenance": {k: v for k, v in (e["evaluation"] or {}).items() if k != "metrics"}, "probe_provenance": [{"path": p["path"], "status": p["status"], "config": p["config"], "results": p["results"], "features_manifest": p["features_manifest"]} for p in e["probes"]], "smoke_proof": e["smoke_proof"]} for e in selected_experiments]
-    mo.vstack([mo.md("## Split, class coverage, protocol and provenance\nOfficial train / validation membership is preserved. Any feature normalization is fit on training only. Unseen validation labels and known-label cross-entropy denominator are reported by probes. Read the explicit sampled class coverage: this selected source subset is not asserted to be class-balanced or all 1,000 classes. Empty metric lists mean pending, not zero accuracy."), mo.accordion({"Full artifact provenance / capacity / pooling / sample selection": mo.md("```json\n" + json.dumps(_provenance, indent=2) + "\n```"), "Read paths and modification times": mo.ui.table(campaign_data["artifacts"] + smoke_data["artifacts"], selection=None)})])
+def provenance(
+    Path,
+    campaign_data,
+    json,
+    mo,
+    selected_experiments,
+    smoke_data,
+):
+    # Render identities and summaries, not repeated per-sample arrays or raw configs.
+    def _scalars(record):
+        return {k: v for k, v in (record or {}).items() if v is None or isinstance(v, (str, int, float, bool))}
+
+    _provenance = []
+    for _experiment in selected_experiments:
+        _probes = []
+        for _probe in _experiment["probes"]:
+            _result = _probe["results"] or {}
+            _config = _probe["config"] or {}
+            _features = _probe["features_manifest"] or {}
+            _identity = _features.get("identity") or _config.get("feature_identity") or {}
+            _selection = _result.get("sample_selection") or _identity.get("sample_selection") or {}
+            _probes.append({
+                "kind": _probe["kind"],
+                "status": _probe["status"],
+                "source_artifacts": {name: str(Path(_probe["path"]) / name) for name in ("probe_results.json", "probe_config.json", "features_manifest.json", "probe_log.jsonl")},
+                "result_identity_and_status": _scalars(_result),
+                "protocol": _scalars(_result.get("protocol") or _config.get("protocol")),
+                "class_coverage_counts": _scalars(_result.get("class_coverage")),
+                "sample_selection_counts_and_hashes": {split: _scalars(selection) for split, selection in _selection.items()},
+                "feature_identity": {**_scalars(_identity), "budgets": _identity.get("budgets"), "representations": _identity.get("representations")},
+                "feature_extraction_status": _scalars(_features),
+                "feature_array_shapes": _features.get("arrays"),
+                "warnings": _result.get("warnings"),
+            })
+        _provenance.append({
+            "id": _experiment["id"], "model": _experiment["model"], "scope": _experiment["scope"], "status": _experiment["status"],
+            "run_dir": _experiment["run_dir"],
+            "manifest_entry": _scalars(_experiment["manifest_entry"]),
+            "state_summary": _scalars(_experiment["state"]),
+            "stages": [{
+                "stage": stage["stage"], "status": stage["status"],
+                "actual_completed_steps": stage["actual_completed_steps"], "configured_steps": stage["configured_steps"],
+                "config_path": str(Path(stage["path"]) / "config.json"),
+                "summary_path": str(Path(stage["path"]) / "summary.json"),
+                "summary": _scalars(stage["summary"]),
+            } for stage in _experiment["stages"]],
+            "evaluation_path": _experiment["eval_path"],
+            "evaluation_identity_and_split": _scalars(_experiment["evaluation"]),
+            "probe_provenance": _probes,
+            "smoke_proof_path": str(Path(_experiment["run_dir"]) / "smoke-proof.json"),
+        })
+    _provenance_view = mo.vstack([
+        mo.md("## Split, class coverage, protocol and provenance\nOfficial train / validation membership is preserved. Any feature normalization is fit on training only. Unseen validation labels and the known-label cross-entropy denominator are reported by probes. Read the explicit sampled class counts: this selected source subset is not asserted to be class-balanced or all 1,000 classes. Empty metric lists mean pending, not zero accuracy.\n\nThe disclosure below contains checkpoint/cache identities, complete scalar probe protocol, sample counts/hashes, class coverage counts and artifact paths. Full per-sample IDs/labels, per-class coverage, raw training configs/state and all metrics remain in those source artifacts; they are not embedded repeatedly in this page. The metrics/capacity table above retains every available probe result condition."),
+        mo.accordion({
+            "Artifact identities / protocol / sample coverage (summary)": mo.md("```json\n" + json.dumps(_provenance, indent=2) + "\n```"),
+            "Read paths and modification times": mo.ui.table(campaign_data["artifacts"] + smoke_data["artifacts"], selection=None),
+        }),
+    ])
+    _provenance_view
     return
 
 
