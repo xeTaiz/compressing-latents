@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import shutil
 from pathlib import Path
 
 import numpy as np
@@ -12,6 +13,11 @@ from torch import nn
 from compression import probe
 from compression.cache import FeatureCacheDataset, FeatureCacheWriter
 from compression.model import ChannelStats, OrderedCompressor, export_compressor, load_compressor
+
+
+@pytest.fixture(autouse=True)
+def isolated_probe_cache(tmp_path, monkeypatch):
+    monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path / "xdg-cache"))
 
 
 def labeled_cache(root: Path, *, model: str = "qwen", missing_label: bool = False,
@@ -213,7 +219,8 @@ def test_resume_rejects_changed_checkpoint_bytes_even_same_cache_and_stage(tmp_p
     assert (root / "probe_results.json").read_bytes() == before
 
 
-def test_partial_epoch_deadline_resume_is_identical_to_uninterrupted_sgd(tmp_path, monkeypatch):
+@pytest.mark.parametrize("resume_from", ["worker-local", "legacy"])
+def test_partial_epoch_deadline_resume_is_identical_to_uninterrupted_sgd(tmp_path, monkeypatch, resume_from):
     cache = labeled_cache(tmp_path / "cache")
     full, partial = tmp_path / "full", tmp_path / "partial"
     expected = probe.run_probe(arguments(cache, full))
@@ -233,9 +240,39 @@ def test_partial_epoch_deadline_resume_is_identical_to_uninterrupted_sgd(tmp_pat
         patch.setattr(probe, "check_deadline", boundary)
         stopped = probe.run_probe(arguments(cache, partial))
     assert stopped["status"] == "deadline" and stopped["metrics"] == []
-    saved = torch.load(partial / "heads/original.pt", weights_only=True)
+    manifest = json.loads((partial / "features_manifest.json").read_text())
+    work = Path(manifest["storage"]["work_dir"])
+    assert work.is_absolute() and manifest["storage"]["scope"] == "worker-local"
+    assert manifest["completed"] is False and manifest["storage"]["working_completed"] is True
+    assert not (partial / "heads/original.pt").exists()
+    assert stopped["classifier_progress"]["original"] == {
+        "epochs_completed": 0, "cursor": 2, "storage": "worker-local"}
+    saved = torch.load(work / "heads/original.pt", weights_only=True)
     assert saved["epoch"] == 0 and saved["cursor"] == 2
-    resumed = probe.run_probe(arguments(cache, partial))
+    normalization = (work / "heads/original-normalization.pt").read_bytes()
+    checkpoint_bytes = (work / "heads/original.pt").read_bytes()
+    if resume_from == "legacy":
+        # Emulate the old shared mutable layout using genuinely committed state.
+        shutil.copytree(work / "features", partial / "features")
+        shutil.copytree(work / "heads", partial / "heads")
+        legacy = json.loads((work / "features_manifest.json").read_text())
+        assert "storage" not in legacy and legacy["completed"] is True
+        (partial / "features_manifest.json").write_text(json.dumps(legacy))
+        shutil.rmtree(work)
+    real_migrate = probe.ProbeStorage.migrate
+    def migrate(storage, deadline):
+        imported = real_migrate(storage, deadline)
+        if resume_from == "legacy":
+            assert (storage.work / "heads/original.pt").read_bytes() == checkpoint_bytes
+            assert (storage.work / "heads/original-normalization.pt").read_bytes() == normalization
+            local = json.loads((storage.work / "features_manifest.json").read_text())
+            assert local["completed"] is True and "storage" not in local
+        return imported
+    with monkeypatch.context() as patch:
+        patch.setattr(probe.ProbeStorage, "migrate", migrate)
+        patch.setattr(probe, "fit_normalization",
+                      lambda *args, **kwargs: pytest.fail("committed normalization was not reused"))
+        resumed = probe.run_probe(arguments(cache, partial))
     assert resumed["status"] == "completed" and resumed["metrics"] == expected["metrics"]
     a = torch.load(full / "heads/original.pt", weights_only=True)
     b = torch.load(partial / "heads/original.pt", weights_only=True)
@@ -244,6 +281,312 @@ def test_partial_epoch_deadline_resume_is_identical_to_uninterrupted_sgd(tmp_pat
     for index in a["optimizer"]["state"]:
         assert torch.equal(a["optimizer"]["state"][index]["momentum_buffer"],
                            b["optimizer"]["state"][index]["momentum_buffer"])
+    assert (partial / "heads/original-normalization.pt").read_bytes() == normalization
+
+
+@pytest.mark.parametrize("location", ["xdg", "home", "explicit"])
+def test_working_cache_location_identity_and_path_free_config(tmp_path, monkeypatch, location):
+    cache = labeled_cache(tmp_path / "cache")
+    root = tmp_path / "run"
+    extra = []
+    if location == "home":
+        monkeypatch.delenv("XDG_CACHE_HOME")
+        monkeypatch.setenv("HOME", str(tmp_path / "home"))
+        expected = tmp_path / "home/.cache/compressing-latents/probes" / probe.identity(str(root.resolve()))
+    elif location == "explicit":
+        monkeypatch.chdir(tmp_path)
+        extra = ["--work-dir", "local-work"]
+        expected = tmp_path / "local-work"
+    else:
+        expected = tmp_path / "xdg-cache/compressing-latents/probes" / probe.identity(str(root.resolve()))
+    def stop_training(*args, **kwargs):
+        raise probe.ProbeDeadline()
+    monkeypatch.setattr(probe, "train_head", stop_training)
+    result = probe.run_probe(arguments(cache, root, *extra))
+    assert result["status"] == "deadline"
+    shared = json.loads((root / "features_manifest.json").read_text())
+    assert shared["storage"] == {
+        "scope": "worker-local", "work_dir": str(expected.resolve()), "working_completed": True}
+    assert shared["completed"] is False
+    local = json.loads((expected / "features_manifest.json").read_text())
+    assert local["completed"] is True and "storage" not in local
+    assert local["rows_completed"] == {"train": 6, "validation": 3}
+    canonical_config = (root / "probe_config.json").read_bytes()
+    assert (expected / "probe_config.json").read_bytes() == canonical_config
+    config = json.loads(canonical_config)
+    assert set(config) == {"format", "feature_identity", "protocol", "device", "torch_version"}
+    assert str(expected) not in canonical_config.decode() and str(root) not in canonical_config.decode()
+    monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path / "different-cache"))
+    followed = probe.run_probe(arguments(cache, root))
+    assert followed["feature_artifacts"]["storage"]["work_dir"] == str(expected.resolve())
+    assert not (tmp_path / "different-cache").exists()
+    if location == "explicit":
+        with pytest.raises(ValueError, match="workspace identity mismatch"):
+            probe.run_probe(arguments(cache, tmp_path / "other-run", *extra))
+
+
+@pytest.mark.parametrize("damage,message", [
+    ("manifest", "worker-local working cache is missing"),
+    ("config", "worker-local working cache is missing"),
+    ("directory", "worker-local working cache is missing"),
+    ("foreign-config", "worker-local probe configuration identity mismatch"),
+    ("foreign-manifest", "feature preparation identity mismatch"),
+    ("different-work", "working cache is at"),
+])
+def test_worker_local_pointer_rejects_missing_or_foreign_cache(tmp_path, monkeypatch, damage, message):
+    cache = labeled_cache(tmp_path / "cache")
+    root = tmp_path / "run"
+    def stop_training(*args, **kwargs):
+        raise probe.ProbeDeadline()
+    with monkeypatch.context() as patch:
+        patch.setattr(probe, "train_head", stop_training)
+        probe.run_probe(arguments(cache, root))
+    pointer = json.loads((root / "features_manifest.json").read_text())
+    work = Path(pointer["storage"]["work_dir"])
+    assert pointer["rows_completed"] == {"train": 6, "validation": 3}
+    # Plausible shared arrays and full shared cursors must never substitute for
+    # the local manifest/config that actually own the committed feature state.
+    shutil.copytree(work / "features", root / "features")
+    extra = []
+    if damage == "directory":
+        shutil.rmtree(work)
+    elif damage in {"manifest", "config"}:
+        (work / ("features_manifest.json" if damage == "manifest" else "probe_config.json")).unlink()
+    elif damage == "foreign-config":
+        path = work / "probe_config.json"
+        foreign = json.loads(path.read_text())
+        foreign["protocol"]["seed"] += 1
+        path.write_text(json.dumps(foreign))
+    elif damage == "foreign-manifest":
+        path = work / "features_manifest.json"
+        foreign = json.loads(path.read_text())
+        foreign["identity"]["cache_identity"] = "foreign-cache"
+        path.write_text(json.dumps(foreign))
+    else:
+        extra = ["--work-dir", str(tmp_path / "replacement")]
+    before = {name: (root / name).read_bytes() for name in
+              ("probe_config.json", "features_manifest.json", "probe_results.json", "probe_log.jsonl")}
+    with pytest.raises(ValueError, match=message):
+        probe.run_probe(arguments(cache, root, *extra))
+    assert {name: (root / name).read_bytes() for name in before} == before
+    assert not (tmp_path / "replacement").exists()
+
+
+def test_legacy_migration_copies_only_committed_prefix_then_resumes_identically(tmp_path, monkeypatch):
+    cache = labeled_cache(tmp_path / "cache")
+    full, legacy, work = tmp_path / "full", tmp_path / "legacy", tmp_path / "local-work"
+    expected = probe.run_probe(arguments(cache, full))
+    legacy.mkdir()
+    shutil.copyfile(full / "probe_config.json", legacy / "probe_config.json")
+    shutil.copytree(full / "features", legacy / "features")
+    manifest = json.loads((full / "features_manifest.json").read_text())
+    manifest.pop("storage")
+    manifest.update(completed=False, rows_completed={"train": 2, "validation": 1})
+    (legacy / "features_manifest.json").write_text(json.dumps(manifest))
+    for name in manifest["arrays"]:
+        array = np.load(legacy / "features" / f"{name}.npy", mmap_mode="r+")
+        committed = manifest["rows_completed"][name.split("-", 1)[0]]
+        array[committed:] = -12345
+        array.flush()
+        array._mmap.close()
+    config = json.loads((legacy / "probe_config.json").read_text())
+    storage = probe.ProbeStorage(legacy.resolve(), str(work), config, manifest["arrays"],
+                                 [("original", None)], 3)
+    real_fsync, real_json = probe.os.fsync, probe.atomic_json
+    fsyncs = 0
+    def fsync(fd):
+        nonlocal fsyncs
+        result = real_fsync(fd)
+        fsyncs += 1
+        return result
+    def commit(path, value):
+        if path == work / "features_manifest.json":
+            assert fsyncs >= len(manifest["arrays"])
+            assert not path.exists()
+        return real_json(path, value)
+    with monkeypatch.context() as patch:
+        patch.setattr(probe.os, "fsync", fsync)
+        patch.setattr(probe, "atomic_json", commit)
+        storage.migrate(None)
+    assert json.loads((work / "features_manifest.json").read_text()) == manifest
+    for name, shape in manifest["arrays"].items():
+        actual = np.load(work / "features" / f"{name}.npy")
+        reference = np.load(full / "features" / f"{name}.npy")
+        committed = manifest["rows_completed"][name.split("-", 1)[0]]
+        assert list(actual.shape) == shape and actual.dtype == np.float32
+        np.testing.assert_array_equal(actual[:committed], reference[:committed])
+        assert not np.any(actual[committed:] == -12345)
+    resumed = probe.run_probe(arguments(cache, legacy, "--work-dir", str(work)))
+    assert resumed["status"] == "completed" and resumed["metrics"] == expected["metrics"]
+    for name in manifest["arrays"]:
+        np.testing.assert_array_equal(np.load(legacy / "features" / f"{name}.npy"),
+                                      np.load(full / "features" / f"{name}.npy"))
+    for filename in ("original.pt", "original-normalization.pt"):
+        actual = torch.load(legacy / "heads" / filename, weights_only=True)
+        reference = torch.load(full / "heads" / filename, weights_only=True)
+        for key in ("head",) if filename == "original.pt" else ("mean", "std"):
+            if key == "head":
+                for parameter in actual[key]:
+                    assert torch.equal(actual[key][parameter], reference[key][parameter])
+            else:
+                assert torch.equal(actual[key], reference[key])
+
+
+def test_final_publication_preserves_canonical_consumer_and_live_epoch_progress(tmp_path, monkeypatch):
+    from compression import campaign
+
+    cache = labeled_cache(tmp_path / "cache")
+    root = tmp_path / "run"
+    real_save, real_publish, real_copy = probe.atomic_torch_save, probe.Publisher.__call__, probe.copy_artifact
+    saves, copies, epochs = [], [], []
+    def save(value, path):
+        assert root not in path.parents
+        saves.append(path)
+        return real_save(value, path)
+    def publish(publisher, metric, record):
+        assert not (root / "heads").exists()
+        real_publish(publisher, metric, record)
+        shared = json.loads((root / "features_manifest.json").read_text())
+        snapshot = json.loads((root / "probe_results.json").read_text())
+        rows = [json.loads(line) for line in (root / "probe_log.jsonl").read_text().splitlines()]
+        assert shared["completed"] is False and shared["storage"]["working_completed"] is True
+        assert snapshot["status"] == "running" and snapshot["metrics"] == [metric]
+        assert snapshot["classifier_progress"]["original"] == {
+            "epochs_completed": record["epoch"], "cursor": 0, "storage": "worker-local"}
+        assert [row["epoch"] for row in rows] == list(range(1, record["epoch"] + 1))
+        assert rows[-1]["val_top1"] == metric["top1"]
+        epochs.append(record["epoch"])
+    def copy(source, destination, deadline):
+        shared = json.loads((root / "features_manifest.json").read_text())
+        assert shared["completed"] is False and shared["storage"]["scope"] == "worker-local"
+        real_copy(source, destination, deadline)
+        assert source.read_bytes() == destination.read_bytes()
+        copies.append(destination.relative_to(root).as_posix())
+    monkeypatch.setattr(probe, "atomic_torch_save", save)
+    monkeypatch.setattr(probe.Publisher, "__call__", publish)
+    monkeypatch.setattr(probe, "copy_artifact", copy)
+    result = probe.run_probe(arguments(cache, root))
+    assert result["status"] == "completed" and epochs == [1, 2, 3]
+    assert len(saves) == 4  # One normalization and three mutable epoch heads, all local.
+    expected_paths = {"features/train-original.npy", "features/validation-original.npy",
+                      "heads/original.pt", "heads/original-normalization.pt"}
+    assert set(copies) == expected_paths and len(copies) == len(expected_paths)
+    assert result["classifier_progress"]["original"] == {
+        "epochs_completed": 3, "cursor": 0, "storage": "shared"}
+    shared = json.loads((root / "features_manifest.json").read_text())
+    assert shared["completed"] is True and shared["storage"] == {"scope": "shared"}
+    assert result["feature_artifacts"]["completed"] is True
+    assert campaign.completed_probe(
+        {"original_probe_dir": str(root), "cache_dir": str(cache), "model": "qwen"},
+        {"probe_protocol": result["protocol"]}, {"feature_dim": 2},
+        original=True, digest="", device="cpu")
+
+
+@pytest.mark.parametrize("interruption", ["before", "during-first", "during-second"])
+def test_publication_deadline_cleans_temporary_files_and_resumes_receipt(tmp_path, monkeypatch, interruption):
+    cache = labeled_cache(tmp_path / "cache")
+    root = tmp_path / "run"
+    real_publish, real_copy, real_check = probe.ProbeStorage.publish, probe.copy_artifact, probe.check_deadline
+    attempts, completed = [], []
+    def copy(source, destination, deadline):
+        relative = destination.relative_to(root).as_posix()
+        attempts.append(relative)
+        target = 1 if interruption == "during-first" else 2
+        if interruption != "before" and len(attempts) == target:
+            checks = 0
+            def interrupt(copy_deadline):
+                nonlocal checks
+                checks += 1
+                if checks == 4:
+                    # The first bounded chunk was written to the owned temporary.
+                    raise probe.ProbeDeadline()
+                return real_check(copy_deadline)
+            with monkeypatch.context() as patch:
+                patch.setattr(probe, "check_deadline", interrupt)
+                return real_copy(source, destination, deadline)
+        real_copy(source, destination, deadline)
+        completed.append(relative)
+    def publish(storage, manifest, publisher, deadline):
+        return real_publish(storage, manifest, publisher, 0 if interruption == "before" else deadline)
+    with monkeypatch.context() as patch:
+        patch.setattr(probe, "copy_artifact", copy)
+        patch.setattr(probe.ProbeStorage, "publish", publish)
+        stopped = probe.run_probe(arguments(cache, root))
+    assert stopped["status"] == "deadline" and stopped["metrics"][0]["epochs_completed"] == 3
+    shared = json.loads((root / "features_manifest.json").read_text())
+    work = Path(shared["storage"]["work_dir"])
+    assert shared["completed"] is False and shared["storage"]["working_completed"] is True
+    local = json.loads((work / "features_manifest.json").read_text())
+    assert local["completed"] is True and "storage" not in local
+    assert not list(root.rglob("*.tmp-*")) and not list(work.rglob("*.tmp-*"))
+    artifacts = {f"features/{name}.npy" for name in local["arrays"]}
+    artifacts.update({"heads/original.pt", "heads/original-normalization.pt"})
+    local_bytes = {name: (work / name).read_bytes() for name in artifacts}
+    assert torch.load(work / "heads/original.pt", weights_only=True)["epoch"] == 3
+    receipt_path = work / "publication.json"
+    receipt = json.loads(receipt_path.read_text()) if receipt_path.exists() else {"artifacts": {}}
+    assert set(receipt["artifacts"]) == set(completed)
+    if interruption == "before":
+        assert attempts == [] and not receipt_path.exists()
+    else:
+        assert not (root / attempts[-1]).exists()
+    previously_copied = set(completed)
+    resumed_copies = []
+    def resume_copy(source, destination, deadline):
+        relative = destination.relative_to(root).as_posix()
+        assert relative not in previously_copied
+        assert json.loads((root / "features_manifest.json").read_text())["completed"] is False
+        real_copy(source, destination, deadline)
+        completed.append(relative)
+        resumed_copies.append(relative)
+    with monkeypatch.context() as patch:
+        patch.setattr(probe, "copy_artifact", resume_copy)
+        patch.setattr(torch.optim.SGD, "step",
+                      lambda *args, **kwargs: pytest.fail("final local classifier was retrained"))
+        resumed = probe.run_probe(arguments(cache, root))
+    assert resumed["status"] == "completed" and resumed["metrics"] == stopped["metrics"]
+    assert set(resumed_copies) == artifacts - previously_copied
+    assert set(completed) == artifacts and len(completed) == len(artifacts)
+    for name in artifacts:
+        assert (root / name).read_bytes() == local_bytes[name]
+    final_receipt = json.loads(receipt_path.read_text())
+    assert set(final_receipt["artifacts"]) == artifacts
+    assert final_receipt["identity"] == probe.identity(json.loads((root / "probe_config.json").read_text()))
+    assert json.loads((root / "features_manifest.json").read_text())["storage"] == {"scope": "shared"}
+    shutil.rmtree(work)
+    reused = probe.run_probe(arguments(cache, root, "--deadline", "2000-01-01T00:00:00+00:00"))
+    assert reused["status"] == "completed" and reused["metrics"] == resumed["metrics"]
+    assert not work.exists()
+
+
+def test_copy_artifact_deadline_preserves_destination_and_cleans_only_owned_temporary(tmp_path, monkeypatch):
+    source, destination = tmp_path / "source.bin", tmp_path / "destination.bin"
+    source.write_bytes(b"x" * ((1 << 20) * 2 + 17))
+    destination.write_bytes(b"previous committed artifact")
+    unrelated = tmp_path / ".destination.bin.tmp-unrelated"
+    unrelated.write_bytes(b"another writer")
+    real_check = probe.check_deadline
+    checks = 0
+    def interrupt(deadline):
+        nonlocal checks
+        checks += 1
+        if checks == 4:
+            # Exactly one bounded chunk has reached the private temporary.
+            owned = [path for path in tmp_path.glob(".destination.bin.tmp-*") if path != unrelated]
+            assert len(owned) == 1 and owned[0].stat().st_size == 1 << 20
+            assert destination.read_bytes() == b"previous committed artifact"
+            raise probe.ProbeDeadline()
+        return real_check(deadline)
+    with monkeypatch.context() as patch:
+        patch.setattr(probe, "check_deadline", interrupt)
+        with pytest.raises(probe.ProbeDeadline):
+            probe.copy_artifact(source, destination, None)
+    assert destination.read_bytes() == b"previous committed artifact"
+    assert list(tmp_path.glob(".destination.bin.tmp-*")) == [unrelated]
+    assert unrelated.read_bytes() == b"another writer"
+    probe.copy_artifact(source, destination, None)
+    assert destination.read_bytes() == source.read_bytes()
+    assert list(tmp_path.glob(".destination.bin.tmp-*")) == [unrelated]
 
 
 def test_real_compressor_encodes_once_then_physically_slices_and_pools(tmp_path, monkeypatch):

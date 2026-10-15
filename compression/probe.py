@@ -1,8 +1,14 @@
 """Frozen native/reconstruction/direct-code linear probes, without backbone imports.
 
-Vectors are float32 disk mmaps. Ordered codes are encoded once at the largest
-requested budget, then physically sliced; they are never pooled or decoded for
-the compressed classifier. All affine preprocessing is fitted on train only.
+Vectors are float32 disk mmaps in a worker-local workspace (``--work-dir``, or
+``$XDG_CACHE_HOME/compressing-latents/probes/<hash-of-run-dir>`` with ``~/.cache``
+as the cache-home fallback). Config identity excludes storage paths. Only small
+progress metadata/logs are shared while running; final arrays and classifiers
+are atomically published to the canonical run directory before completion.
+Ordered codes are encoded once at the largest requested budget, then physically
+sliced; they are never pooled or decoded for the compressed classifier. All
+affine preprocessing is fitted on train only. Partial local caches must remain
+on the same worker to resume; a missing cache is an explicit error.
 """
 from __future__ import annotations
 
@@ -138,13 +144,40 @@ def condition_name(condition: str, budget: int | None) -> str:
     return condition if budget is None else f"{condition}-{budget}"
 
 
-def prepare_features(root: Path, datasets: dict, indices: dict, representations: list[str],
-                     budgets: list[int], pooling: str, bundle: Any, device: str,
-                     feature_identity: dict, deadline: float | None) -> dict:
-    """Batch native extraction; publish only flushed, all-condition row prefixes."""
-    manifest_path = root / "features_manifest.json"
+def copy_artifact(source: Path, destination: Path, deadline: float | None) -> None:
+    """Bound copy memory and deadline latency; never expose an incomplete file."""
+    check_deadline(deadline)
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    tmp = destination.with_name(f".{destination.name}.tmp-{os.getpid()}")
+    try:
+        with source.open("rb") as reader, tmp.open("wb") as writer:
+            while True:
+                check_deadline(deadline)
+                chunk = reader.read(1 << 20)
+                if not chunk:
+                    break
+                check_deadline(deadline)
+                writer.write(chunk)
+            check_deadline(deadline)
+            writer.flush()
+            os.fsync(writer.fileno())
+        check_deadline(deadline)
+        os.replace(tmp, destination)
+    finally:
+        tmp.unlink(missing_ok=True)
+
+
+def read_normalization(path: Path, run_identity: str, condition: str, budget: int | None) -> dict:
+    norm = torch.load(path, map_location="cpu", weights_only=True)
+    if (norm["identity"] != run_identity or norm["condition"] != condition
+            or norm["budget"] != budget):
+        raise ValueError(f"normalization identity mismatch: {path}")
+    return norm
+
+
+def feature_specs(datasets: dict, indices: dict, representations: list[str],
+                  budgets: list[int], bundle: Any) -> dict:
     specs = {}
-    max_k = max(budgets) if bundle is not None else None
     for split, dataset in datasets.items():
         count = len(indices[split])
         if "original" in representations:
@@ -153,26 +186,214 @@ def prepare_features(root: Path, datasets: dict, indices: dict, representations:
             for k in budgets:
                 specs[f"{split}-reconstructed-{k}"] = [count, dataset.feature_dim]
         if "compressed" in representations:
-            specs[f"{split}-codes"] = [count, max_k, bundle.model.width]
+            specs[f"{split}-codes"] = [count, max(budgets), bundle.model.width]
+    return specs
+
+
+def validate_feature_manifest(manifest: dict, feature_identity: dict, specs: dict) -> None:
+    if (manifest["identity"] != feature_identity or manifest["arrays"] != specs
+            or manifest["format"] != FORMAT or manifest["dtype"] != "float32"):
+        raise ValueError("feature preparation identity mismatch; refusing foreign artifacts")
+    splits = {name.split("-", 1)[0]: shape[0] for name, shape in specs.items()}
+    if set(manifest["rows_completed"]) != set(splits):
+        raise ValueError("feature preparation split mismatch")
+    for split, count in splits.items():
+        rows = manifest["rows_completed"][split]
+        if type(rows) is not int or not 0 <= rows <= count:
+            raise ValueError("invalid committed feature row count")
+        if manifest["completed"] and rows != count:
+            raise ValueError("completed feature manifest has incomplete rows")
+
+
+class ProbeStorage:
+    """One local mutable workspace, with a final-only canonical artifact copy."""
+
+    def __init__(self, root: Path, requested_work: str | None, config: dict,
+                 specs: dict, pairs: list, epochs: int):
+        self.root, self.config, self.specs, self.pairs = root, config, specs, pairs
+        self.run_identity = identity(config)
+        path = root / "features_manifest.json"
+        self.previous = json.loads(path.read_text()) if path.exists() else None
+        if self.previous is not None:
+            validate_feature_manifest(self.previous, config["feature_identity"], specs)
+        storage = self.previous.get("storage", {}) if self.previous else {}
+        # Legacy feature manifests marked extraction complete before head training.
+        # Reuse shared storage only when every requested classifier is final too.
+        self.shared_complete = bool(self.previous and self.previous["completed"]
+                                    and storage.get("scope") != "worker-local")
+        if self.shared_complete:
+            for condition, budget in pairs:
+                name = condition_name(condition, budget)
+                state = read_head(root / "heads" / f"{name}.pt", self.run_identity)
+                norm_path = root / "heads" / f"{name}-normalization.pt"
+                if state is None or state["epoch"] != epochs or state["cursor"] != 0 or not norm_path.exists():
+                    self.shared_complete = False
+                    break
+                read_normalization(norm_path, self.run_identity, condition, budget)
+        if self.shared_complete:
+            self.work = root
+            return
+        if storage.get("scope") == "worker-local":
+            self.work = Path(storage["work_dir"]).resolve()
+            if requested_work is not None and Path(requested_work).expanduser().resolve() != self.work:
+                raise ValueError(f"working cache is at {self.work}; --work-dir must match it")
+            if not (self.work / "probe_config.json").exists() or not (self.work / "features_manifest.json").exists():
+                raise ValueError(f"worker-local working cache is missing at {self.work}; "
+                                 "cannot resume from stale shared feature cursors")
+        else:
+            cache_home = Path(os.environ.get("XDG_CACHE_HOME") or Path.home() / ".cache").expanduser()
+            self.work = (Path(requested_work).expanduser() if requested_work is not None else
+                         cache_home / "compressing-latents" / "probes" / identity(str(root))).resolve()
+        if self.work == root or root in self.work.parents:
+            raise ValueError("--work-dir must be outside the canonical run directory")
+        self.work.mkdir(parents=True, exist_ok=True)
+        config_path = self.work / "probe_config.json"
+        owner_path = self.work / "work_identity.json"
+        owner = {"canonical_run_dir": str(root), "identity": self.run_identity}
+        if config_path.exists():
+            if json.loads(config_path.read_text()) != config:
+                raise ValueError("worker-local probe configuration identity mismatch")
+            if not owner_path.exists() or json.loads(owner_path.read_text()) != owner:
+                raise ValueError("worker-local workspace identity mismatch")
+        else:
+            entries = list(self.work.iterdir())
+            # Recover a crash between the two initial identity metadata writes.
+            if entries and not (entries == [owner_path] and json.loads(owner_path.read_text()) == owner):
+                raise ValueError("nonempty worker-local directory has no config; refusing foreign artifacts")
+            atomic_json(owner_path, owner)
+            atomic_json(config_path, config)
+        local_manifest = self.work / "features_manifest.json"
+        if local_manifest.exists():
+            validate_feature_manifest(json.loads(local_manifest.read_text()), config["feature_identity"], specs)
+
+    def migrate(self, deadline: float | None) -> bool:
+        """Import only the legacy shared manifest's durable, all-condition prefixes."""
+        if self.shared_complete or self.previous is None or (self.work / "features_manifest.json").exists():
+            return False
+        for name, shape in self.specs.items():
+            rows = self.previous["rows_completed"][name.split("-", 1)[0]]
+            source = self.root / "features" / f"{name}.npy"
+            destination = self.work / "features" / f"{name}.npy"
+            check_deadline(deadline)
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            tmp = destination.with_name(f".{destination.name}.tmp-{os.getpid()}")
+            original = pending = None
+            try:
+                if source.exists():
+                    original = np.load(source, mmap_mode="r", allow_pickle=False)
+                    if list(original.shape) != shape or original.dtype != np.float32:
+                        raise ValueError(f"feature shape/precision mismatch: {source}")
+                elif rows:
+                    raise ValueError(f"missing committed feature array {source}")
+                pending = np.lib.format.open_memmap(tmp, mode="w+", dtype=np.float32, shape=tuple(shape))
+                # Copy only committed rows, in bounded blocks even for wide codes.
+                block_rows = max(1, (1 << 20) // (int(np.prod(shape[1:])) * 4))
+                for start in range(0, rows, block_rows):
+                    check_deadline(deadline)
+                    pending[start:min(start + block_rows, rows)] = original[start:min(start + block_rows, rows)]
+                check_deadline(deadline)
+                pending.flush()
+                pending._mmap.close()
+                pending = None
+                with tmp.open("rb") as handle:
+                    os.fsync(handle.fileno())
+                check_deadline(deadline)
+                os.replace(tmp, destination)
+            finally:
+                if original is not None:
+                    original._mmap.close()
+                if pending is not None:
+                    pending._mmap.close()
+                tmp.unlink(missing_ok=True)
+        for condition, budget in self.pairs:
+            name = condition_name(condition, budget)
+            head = self.root / "heads" / f"{name}.pt"
+            norm = self.root / "heads" / f"{name}-normalization.pt"
+            state = read_head(head, self.run_identity)
+            if state is not None and not self.previous["completed"]:
+                raise ValueError("classifier checkpoint exists for incomplete committed features")
+            if norm.exists():
+                read_normalization(norm, self.run_identity, condition, budget)
+                copy_artifact(norm, self.work / "heads" / norm.name, deadline)
+            elif state is not None:
+                raise ValueError(f"missing committed classifier normalization {norm}")
+            if state is not None:
+                copy_artifact(head, self.work / "heads" / head.name, deadline)
+        # No local cursor is visible until every imported file is locally fsynced.
+        local = {key: value for key, value in self.previous.items() if key != "storage"}
+        atomic_json(self.work / "features_manifest.json", local)
+        return True
+
+    def progress(self, manifest: dict, publisher) -> None:
+        storage = ({"scope": "shared"} if self.shared_complete else
+                   {"scope": "worker-local", "work_dir": str(self.work),
+                    "working_completed": manifest["completed"]})
+        shared = {**manifest, "completed": self.shared_complete, "storage": storage}
+        if not self.shared_complete:
+            atomic_json(self.root / "features_manifest.json", shared)
+        publisher.result["feature_artifacts"] = {
+            "manifest": "features_manifest.json", "precision": "float32",
+            "completed": self.shared_complete, "rows_completed": dict(manifest["rows_completed"]),
+            "storage": storage}
+        publisher.snapshot("running")
+
+    def publish(self, manifest: dict, publisher, deadline: float | None) -> None:
+        if self.shared_complete:
+            return
+        check_deadline(deadline)
+        if not manifest["completed"]:
+            raise ValueError("cannot publish incomplete working features")
+        receipt_path = self.work / "publication.json"
+        receipt = (json.loads(receipt_path.read_text()) if receipt_path.exists() else
+                   {"identity": self.run_identity, "artifacts": {}})
+        if receipt["identity"] != self.run_identity:
+            raise ValueError("publication identity mismatch")
+        paths = [f"features/{name}.npy" for name in self.specs]
+        for condition, budget in self.pairs:
+            name = condition_name(condition, budget)
+            state = read_head(self.work / "heads" / f"{name}.pt", self.run_identity)
+            if state is None or state["epoch"] != self.config["protocol"]["epochs"] or state["cursor"] != 0:
+                raise ValueError(f"cannot publish incomplete classifier {name}")
+            read_normalization(self.work / "heads" / f"{name}-normalization.pt",
+                               self.run_identity, condition, budget)
+            paths.extend([f"heads/{name}.pt", f"heads/{name}-normalization.pt"])
+        for relative in paths:
+            check_deadline(deadline)
+            source, destination = self.work / relative, self.root / relative
+            size = source.stat().st_size
+            if (receipt["artifacts"].get(relative) == size and destination.exists()
+                    and destination.stat().st_size == size):
+                continue
+            copy_artifact(source, destination, deadline)
+            receipt["artifacts"][relative] = size
+            atomic_json(receipt_path, receipt)
+        check_deadline(deadline)
+        atomic_json(self.root / "features_manifest.json", {**manifest, "storage": {"scope": "shared"}})
+        self.shared_complete = True
+        for progress in publisher.result["classifier_progress"].values():
+            progress["storage"] = "shared"
+        self.progress(manifest, publisher)
+
+
+def prepare_features(root: Path, datasets: dict, indices: dict, representations: list[str],
+                     budgets: list[int], pooling: str, bundle: Any, device: str,
+                     feature_identity: dict, deadline: float | None, publish_manifest=None) -> dict:
+    """Batch native extraction; publish only flushed, all-condition row prefixes."""
+    manifest_path = root / "features_manifest.json"
+    specs = feature_specs(datasets, indices, representations, budgets, bundle)
+    max_k = max(budgets) if bundle is not None else None
     manifest = {"format": FORMAT, "identity": feature_identity, "dtype": "float32",
                 "arrays": specs, "rows_completed": {split: 0 for split in datasets}, "completed": False}
     if manifest_path.exists():
         previous = json.loads(manifest_path.read_text())
-        if previous["identity"] != feature_identity or previous["arrays"] != specs:
-            raise ValueError("feature preparation identity mismatch; refusing foreign artifacts")
+        validate_feature_manifest(previous, feature_identity, specs)
         manifest = previous
-        if set(manifest["rows_completed"]) != set(datasets):
-            raise ValueError("feature preparation split mismatch")
-        for split in datasets:
-            rows = manifest["rows_completed"][split]
-            if not isinstance(rows, int) or not 0 <= rows <= len(indices[split]):
-                raise ValueError("invalid committed feature row count")
-            if manifest["completed"] and rows != len(indices[split]):
-                raise ValueError("completed feature manifest has incomplete rows")
     else:
         if (root / "features").exists() and any((root / "features").iterdir()):
             raise ValueError("uncommitted foreign feature files without a manifest")
         atomic_json(manifest_path, manifest)
+    if publish_manifest is not None:
+        publish_manifest(manifest)
     feature_dir = root / "features"
     feature_dir.mkdir(exist_ok=True)
     arrays = {}
@@ -207,6 +428,8 @@ def prepare_features(root: Path, datasets: dict, indices: dict, representations:
                         os.fsync(handle.fileno())
             manifest["rows_completed"][split] = stop
             atomic_json(manifest_path, manifest)
+            if publish_manifest is not None:
+                publish_manifest(manifest)
 
         with torch.inference_mode():
             for split, dataset in datasets.items():
@@ -269,6 +492,8 @@ def prepare_features(root: Path, datasets: dict, indices: dict, representations:
                     raise
         manifest["completed"] = True
         atomic_json(manifest_path, manifest)
+        if publish_manifest is not None:
+            publish_manifest(manifest)
         return manifest
     finally:
         for array in arrays.values():
@@ -364,10 +589,7 @@ def train_head(root: Path, condition: str, budget: int | None, run_identity: str
             return
         check_deadline(deadline)
         if norm_path.exists():
-            norm = torch.load(norm_path, map_location="cpu", weights_only=True)
-            if (norm["identity"] != run_identity or norm["condition"] != condition
-                    or norm["budget"] != budget):
-                raise ValueError("normalization identity mismatch")
+            norm = read_normalization(norm_path, run_identity, condition, budget)
             mean, std = norm["mean"], norm["std"]
         else:
             mean, std = fit_normalization(train_array, budget, args.batch_size, deadline)
@@ -390,6 +612,7 @@ def train_head(root: Path, condition: str, budget: int | None, run_identity: str
                                "epoch": epoch, "cursor": cursor, "loss_sum": loss_sum,
                                "history": history, "metric": last_metric,
                                "normalization": str(norm_path.relative_to(root))}, head_path)
+            publish.checkpoint(name, epoch, cursor)
         try:
             while epoch < args.epochs:
                 check_deadline(deadline)
@@ -435,22 +658,32 @@ def train_head(root: Path, condition: str, budget: int | None, run_identity: str
 
 
 class Publisher:
-    def __init__(self, root: Path, result: dict, run_identity: str, pairs: list):
-        self.root, self.result, self.started = root, result, time.monotonic()
+    def __init__(self, root: Path, work_root: Path, result: dict, run_identity: str, pairs: list,
+                 recovery_root: Path | None = None):
+        self.root, self.work_root, self.result, self.started = root, work_root, result, time.monotonic()
         self.class_labels = result["class_coverage"]["train_labels"]
         self.offset = 0.0
+        self.recover(run_identity, pairs, recovery_root)
+
+    def recover(self, run_identity: str, pairs: list, source_root: Path | None = None):
+        source_root = self.work_root if source_root is None else source_root
         records = []
+        self.result["metrics"] = []
+        self.result["classifier_progress"] = {}
         for condition, budget in pairs:
-            state = read_head(root / "heads" / f"{condition_name(condition, budget)}.pt", run_identity)
+            name = condition_name(condition, budget)
+            state = read_head(source_root / "heads" / f"{name}.pt", run_identity)
             if state:
+                self.checkpoint(name, state["epoch"], state["cursor"],
+                                "shared" if source_root == self.root else "worker-local")
                 records.extend(state["history"])
                 if state["metric"]:
-                    result["metrics"].append(state["metric"])
+                    self.result["metrics"].append(state["metric"])
         records.sort(key=lambda row: row["elapsed_s"])
         if records:
             self.offset = max(row["elapsed_s"] for row in records)
         # Reconcile a crash between checkpoint commit and JSONL/snapshot publication.
-        path = root / "probe_log.jsonl"
+        path = self.root / "probe_log.jsonl"
         tmp = path.with_name(f".{path.name}.tmp-{os.getpid()}")
         with tmp.open("w") as handle:
             for record in records:
@@ -459,6 +692,11 @@ class Publisher:
             os.fsync(handle.fileno())
         os.replace(tmp, path)
         self.snapshot("running")
+
+    def checkpoint(self, name: str, epoch: int, cursor: int, storage: str | None = None):
+        self.result["classifier_progress"][name] = {
+            "epochs_completed": epoch, "cursor": cursor,
+            "storage": storage or ("shared" if self.work_root == self.root else "worker-local")}
 
     def elapsed(self):
         return self.offset + time.monotonic() - self.started
@@ -569,22 +807,34 @@ def run_probe(args: argparse.Namespace) -> dict:
                   "warnings": ["Direct-code feature_dim=budget*width; classifier head capacity varies with budget and differs from native features.",
                                "Validation cross entropy uses known-label subset; accuracy includes every validation sample."]}
         run_identity = identity(config)
-        publisher = Publisher(root, result, run_identity, conditions(representations, budgets))
+        pairs = conditions(representations, budgets)
+        storage = ProbeStorage(root, getattr(args, "work_dir", None), config,
+                               feature_specs(datasets, indices, representations, budgets, bundle),
+                               pairs, args.epochs)
+        result["feature_artifacts"] = {
+            "manifest": "features_manifest.json", "precision": "float32",
+            "completed": storage.shared_complete,
+            "storage": ({"scope": "shared"} if storage.shared_complete else
+                        {"scope": "worker-local", "work_dir": str(storage.work)})}
+        recovery_root = storage.work if (storage.work / "features_manifest.json").exists() else root
+        publisher = Publisher(root, storage.work, result, run_identity, pairs, recovery_root)
         torch.use_deterministic_algorithms(True)
         torch.backends.cudnn.benchmark = False
         torch.backends.cuda.matmul.allow_tf32 = False
         torch.backends.cudnn.allow_tf32 = False
         try:
-            manifest = prepare_features(root, datasets, indices, representations, budgets, pooling,
-                                        bundle, args.device, feature_identity, deadline)
-            publisher.result["feature_artifacts"] = {"manifest": "features_manifest.json", "precision": "float32",
-                                                      "completed": manifest["completed"]}
+            if storage.migrate(deadline):
+                publisher.recover(run_identity, pairs)
+            manifest = prepare_features(storage.work, datasets, indices, representations, budgets, pooling,
+                                        bundle, args.device, feature_identity, deadline,
+                                        lambda value: storage.progress(value, publisher))
             mapping = {label: i for i, label in enumerate(result["class_coverage"]["train_labels"])}
             train_labels = torch.tensor([mapping[label] for label in labels["train"]], dtype=torch.long)
             validation_labels = torch.tensor([mapping.get(label, -1) for label in labels["validation"]], dtype=torch.long)
-            for condition, budget in conditions(representations, budgets):
-                train_head(root, condition, budget, run_identity, train_labels, validation_labels,
+            for condition, budget in pairs:
+                train_head(storage.work, condition, budget, run_identity, train_labels, validation_labels,
                            len(mapping), args, deadline, publisher)
+            storage.publish(manifest, publisher, deadline)
             publisher.snapshot("completed")
         except ProbeDeadline:
             publisher.snapshot("deadline")
@@ -601,6 +851,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--cache-dir", required=True)
     parser.add_argument("--run-dir", required=True)
+    parser.add_argument("--work-dir", help="worker-local mutable workspace; defaults to XDG_CACHE_HOME or ~/.cache")
     parser.add_argument("--checkpoint")
     parser.add_argument("--representations", default="original,reconstructed,compressed")
     parser.add_argument("--budgets", default=",".join(map(str, DEFAULT_BUDGETS)))
