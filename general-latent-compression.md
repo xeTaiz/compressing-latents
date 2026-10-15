@@ -407,6 +407,36 @@ The manifest uses format `compression-campaign/v1` and explicit experiment paths
 
 The runner divides remaining time among its assigned experiments, initially allocating 22% to fixed training, 48% to prefix training, and 30% to reconstruction/probes, carrying unused time forward. Configured targets remain 10,000/20,000 training steps, but the deadline takes precedence; actual step counts and partial probe epochs determine what was achieved. Graceful trainer boundaries save normal checkpoints, while the campaign enforces subprocess cutoffs and reserves cleanup time. It uses immutable checkpoint snapshots and SHA256-bound evaluation/probe artifacts, preserving older generations when weights change. `state.json` merges disjoint assignments atomically; the dashboard accepts overrides only from matching campaign identity/version.
 
+### 8.8 Completed overnight pilot results
+
+Both K512 compressors completed 10,000 fixed-stage and 20,000 sampled-prefix optimizer steps. Their original-feature baselines and all reconstructed/direct-code probes completed 50 classifier epochs on the same 10,000 training / 1,000 validation images. Final feature arrays, classifier checkpoints and normalization artifacts were published to shared storage, and both managed campaign jobs exited successfully before the cutoff. The final hosted notebook was checked in the browser: completed status rows, training/reconstruction curves, probe curves with original baselines, and classifier-capacity tables were visible; all ten cells were idle without errors.
+
+The following are validation accuracies in percent. Prefixes belong to the completed **K512 checkpoints**, not the separate deadline-limited K256 experiments.
+
+| Representation | First K codes | DINO top-1 | DINO top-5 | Qwen top-1 | Qwen top-5 |
+|---|---:|---:|---:|---:|---:|
+| Original | — | 79.2 | 92.8 | 59.6 | 83.8 |
+| Reconstructed | 4 | 43.2 | 65.2 | 54.1 | 79.4 |
+| Reconstructed | 32 | 69.6 | 88.1 | 54.4 | 81.8 |
+| Reconstructed | 64 | 72.0 | 89.1 | 57.3 | 82.3 |
+| Reconstructed | 128 | 74.1 | 90.1 | 57.3 | 82.6 |
+| Reconstructed | 256 | 75.5 | 91.2 | 57.0 | 83.0 |
+| Reconstructed | 512 | 74.8 | 90.7 | 57.5 | 83.1 |
+| Direct compressed | 4 | 29.8 | 50.9 | 36.5 | 64.2 |
+| Direct compressed | 32 | 30.6 | 52.4 | 21.0 | 46.0 |
+| Direct compressed | 64 | 31.0 | 51.2 | 20.2 | 46.6 |
+| Direct compressed | 128 | 36.0 | 58.0 | 14.1 | 39.4 |
+| Direct compressed | 256 | 34.1 | 53.5 | 17.6 | 40.6 |
+| Direct compressed | 512 | 33.6 | 53.3 | 23.0 | 47.9 |
+
+The direct-code heads have a strong training/validation gap: at K512 their final training cross-entropies were about `1e-8`, versus validation cross-entropies of 216.57 for DINO and 180.83 for Qwen. Head size grows from 2,049,000 parameters at K4 to 262,145,000 at K512, compared with 4,097,000 for native/reconstructed DINO and 1,153,000 for native/reconstructed Qwen. Together with the fixed learning rate and zero weight decay in §8.6, this limits interpretation: worse direct-probe accuracy at larger K does not establish that those prefixes contain less information. No hyperparameter sweep or capacity-matched comparison was performed.
+
+Full 1,000-image reconstruction evaluation also completed. At prefixes 4, 32, 64, 128, 256 and 512, normalized MSE was respectively `[0.706917, 0.447782, 0.401585, 0.358983, 0.322138, 0.297872]` for DINO and `[0.854197, 0.402254, 0.207619, 0.134805, 0.089108, 0.046040]` for Qwen. These aggregate reconstruction errors are distinct from classification accuracy and token-type-specific errors.
+
+The K256 runs remain honestly marked deadline-limited: DINO reached 4,751 fixed / 12,147 prefix steps; Qwen reached 10,000 / 20,000. Both have full validation reconstruction results, but their reconstructed/direct-code classification sweeps did not finish. Their shared original baselines subsequently completed through the K512 assignments. No missing K256 probe result is presented as a completed measurement.
+
+Canonical artifacts are under `runs/overnight-20261014/`: `baselines/{dinov3,qwen38}/probe_results.json` for original features, and the matching SHA-bound paths recorded in `state.json` for K512 reconstruction, `probe_results.json`, per-epoch `probe_log.jsonl`, and feature/publication manifests. The Qwen local-storage recovery acceptance evidence is retained in `qwen38-k512/probe-recovery-proof.json`; private recovery scaffolds were removed. The completed notebook remains hosted and continues to refresh from these artifacts.
+
 
 
 ## 9. Relationship to the SLAM direction
